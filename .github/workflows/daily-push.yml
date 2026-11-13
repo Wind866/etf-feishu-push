@@ -1,0 +1,98 @@
+name: ETF 资金流向 · 每交易日 20:00 推送飞书
+
+on:
+  schedule:
+    # GitHub 的 cron 走 UTC：12:00 UTC = 北京时间 20:00，周一至周五。
+    # 注意两点：① cron 只能表达「周一~周五」，遇到 A 股节假日由脚本内的
+    # 交易日探测自动跳过；② 公共 runner 排队时可能推迟几分钟。
+    - cron: '0 12 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'normal=抓当日并推送 / demo=用演示数据出图（不推送） / preview=抓数出图但不推送'
+        type: choice
+        default: normal
+        options: [normal, demo, preview]
+
+permissions:
+  contents: write          # 需要把 data/history.json 提交回仓库，才能累积多日对照
+
+concurrency:
+  group: etf-flow-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-wqy-zenhei
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -r requirements.txt
+          # akshare 只是兜底数据源，装失败不影响主链路
+          pip install -q -r requirements-optional.txt || echo "::warning::akshare 安装失败，将只使用东财直连"
+
+      - name: Validate config
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: |
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "::error::缺少 FEISHU_WEBHOOK，请在 Settings → Secrets and variables → Actions 中配置"
+            exit 1
+          fi
+
+      - name: Run
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          TZ: Asia/Shanghai
+        run: |
+          MODE="${{ inputs.mode }}"
+          case "$MODE" in
+            demo)    python push.py --demo ;;
+            preview) python push.py --dry-run ;;
+            *)       python push.py ;;
+          esac
+
+      - name: Upload snapshot (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-${{ github.run_id }}
+          path: snapshots/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit history
+        if: always() && inputs.mode != 'demo'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history.json
+          if git diff --cached --quiet; then
+            echo "history.json 无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore(data): ETF 历史 $(date +%Y-%m-%d)"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin HEAD:"${GITHUB_REF_NAME}"

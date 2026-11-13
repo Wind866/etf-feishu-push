@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ETF 各指数主力资金净流入 → 飞书（图片 / 卡片）
+
+一次运行的完整链路：
+    交易日判定 → 抓取全市场 ETF 主力净流入 → 按指数归类汇总（亿元）
+    → 落库 data/history.json → 渲染近 10 个交易日对照表 → 推送飞书
+
+用法：
+    python push.py                    # 抓取 + 推送（Actions 里就是这一条）
+    python push.py --demo             # 用 demo_history.json 出图，看样式，不推送
+    python push.py --no-fetch         # 不抓数，用存档最新数据重推
+    python push.py --dry-run          # 抓数 + 出图，但不推送
+    python push.py --force            # 忽略「今日非交易日」与「同日已推」判断
+    python push.py --card             # 不推图片，改推卡片
+    python push.py --exclude-today    # 图片不含今天（只发历史）
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import traceback
+from datetime import datetime
+
+from etfpush import aggregate, config, feishu, history, render, sources
+
+
+def _now():
+    return datetime.now(config.CN_TZ)
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="ETF 各指数主力净流入 → 飞书",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--demo", action="store_true", help="用演示数据出图（不抓数、不写库、不推送）")
+    p.add_argument("--no-fetch", action="store_true", help="不抓数，用 history.json 最新一条")
+    p.add_argument("--dry-run", action="store_true", help="抓数出图但不推送")
+    p.add_argument("--force", action="store_true", help="忽略交易日与重复推送判断")
+    p.add_argument("--card", action="store_true", help="只发卡片消息，不发图片")
+    p.add_argument("--exclude-today", action="store_true", help="图片中排除今日行")
+    p.add_argument("--days", type=int, default=config.DISPLAY_DAYS, help="展示最近 N 个交易日")
+    return p.parse_args(argv)
+
+
+def _print_table(hist: dict, trade_date: str, days: int) -> None:
+    rows = history.recent_rows(hist, trade_date, days)
+    if not rows:
+        return
+    head = f"{'日期':<8}" + "".join(f"{c:>12}" for c in config.COLUMNS)
+    print("\n" + head)
+    print("-" * len(head))
+    for date_txt, record, is_today in rows:
+        cells = []
+        for col in config.COLUMNS:
+            val = record.get(col)
+            cells.append(f"{float(val):>12.2f}" if isinstance(val, (int, float)) else f"{'-':>12}")
+        print(f"{date_txt + ('*' if is_today else ' '):<8}" + "".join(cells))
+    print()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    started = _now()
+    print(f"=== ETF 资金推送 · {started:%Y-%m-%d %H:%M:%S} (UTC+8) ===")
+
+    # ---------- 1. 取数 ----------
+    if args.demo:
+        hist = history.load_demo()
+        if not hist.get("records"):
+            print("❌ data/demo_history.json 为空，无法演示")
+            return 1
+        trade_date = max(hist["records"].keys())
+        source = "演示数据"
+        print(f"演示模式：使用 {trade_date} 起的 {len(hist['records'])} 天样例数据")
+    elif args.no_fetch:
+        hist = history.load()
+        if not hist.get("records"):
+            print("❌ history.json 无数据，--no-fetch 不可用")
+            return 1
+        trade_date = max(hist["records"].keys())
+        source = "history.json 存档"
+        print(f"复用存档：{trade_date}")
+    else:
+        today = started.date()
+        if not args.force:
+            ok, reason = sources.is_trading_day(today)
+            if not ok:
+                print(f"⏭  跳过：{reason}")
+                return 0
+            print(f"交易日检查通过：{reason}")
+
+        items, source = sources.fetch_flow()
+        stats, info = aggregate.aggregate(items)
+        aggregate.sanity_check(info)
+        trade_date = today.strftime("%Y-%m-%d")
+        print(f"统计完成（{info['total']} 个标的，剔除货币类 {info['cash_excluded']} 只、"
+              f"非ETF {info['non_etf']} 只，未归类 {info['unmapped']} 只）")
+        print("  " + "  ".join(f"{k}={v:.2f}亿" for k, v in stats.items()))
+
+        hist = history.load()
+        if not args.force and history.already_pushed(hist, trade_date, stats):
+            print(f"⏭  今天（{trade_date}）已推送过相同数据，跳过；如需重推加 --force")
+            return 0
+
+        hist = history.upsert(hist, trade_date, stats)
+        hist = history.prune_weekend(hist)
+        if not args.dry_run:
+            history.save(hist)
+            print(f"💾 已写入 {config.HISTORY_PATH.relative_to(config.ROOT)}")
+
+    _print_table(hist, trade_date, args.days)
+
+    # ---------- 2. 出图 ----------
+    png = None
+    try:
+        png = render.render_snapshot(
+            hist, trade_date, source,
+            days=args.days,
+            exclude_today=args.exclude_today,
+            demo=args.demo,
+        )
+        print(f"🖼 图片已生成：{png}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 出图失败（降级为卡片）：{type(exc).__name__}: {exc}")
+
+    # ---------- 3. 推送 ----------
+    if args.demo or args.dry_run or not feishu.webhook():
+        if not feishu.webhook():
+            print("ℹ️ 未配置 FEISHU_WEBHOOK，本次只做本地预览")
+        else:
+            print("ℹ️ dry-run：跳过推送")
+        return 0
+
+    rows = history.recent_rows(hist, trade_date, args.days)
+    sent = False
+    if png and not args.card and os.environ.get("IMAGE_OFF") != "1":
+        try:
+            sent = feishu.send_image(png)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 图片消息失败，降级为卡片：{type(exc).__name__}: {exc}")
+    if not sent:
+        sent = feishu.send_card(rows, trade_date)
+
+    if not sent:
+        raise RuntimeError("图片与卡片均未发送成功")
+
+    # ---------- 4. 记录推送状态 ----------
+    if not (args.demo or args.no_fetch or args.dry_run):
+        stats = hist["records"][trade_date]
+        hist = history.mark_pushed(hist, trade_date, stats, started.strftime("%H:%M:%S"))
+        history.save(hist)
+        print("📝 已记录推送状态（同日重复运行会自动跳过）")
+
+    print(f"=== 完成，用时 {(_now() - started).seconds}s ===")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        print(f"🛑 任务失败：{exc}")
+        traceback.print_exc()
+        feishu.notify_failure(f"{type(exc).__name__}: {exc}")
+        sys.exit(1)
