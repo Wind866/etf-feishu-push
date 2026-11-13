@@ -88,9 +88,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/history.json
+          # history.json 存每日汇总，etf_codes.txt 是离线兜底用的代码清单
+          git add data/history.json data/etf_codes.txt
           if git diff --cached --quiet; then
-            echo "history.json 无变化，跳过提交"
+            echo "无变化，跳过提交"
             exit 0
           fi
           git commit -m "chore(data): ETF 历史 $(date +%Y-%m-%d)"

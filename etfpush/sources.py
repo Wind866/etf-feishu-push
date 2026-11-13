@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
 """数据源层：拿「全市场 ETF 的主力净流入金额（元）」。
 
-为什么是这套组合
+为什么要这么多层
 ----------------
-东财的 `clist/get`（akshare 用的那个接口）在部分网络 / 出口 IP 下会被 WAF
-直接掐断 TLS 连接（表现为 `curl: (56) server closed abruptly`），而且在
-GitHub Actions 的公共 runner 上尤其不稳定。实测 `ulist.np/get` 这条路
-（指定一批 secid 批量取字段）基本不受影响，所以主链路改成：
+1. 主力净流入这个指标，只有东财一家公开可用：
+   腾讯 `ff_` 接口不支持 ETF（直接返回 none_match），新浪的按代码接口
+   对 ETF 会返回符号相反的错值（实测 510050 东财 +0.50亿 / 新浪 -5.33亿），
+   混用等于把表格画错。所以"多数据源"只能是东财的多通道 + 多镜像。
+2. 东财的接入点很多（push2 / push2delay / 1.push2 … 共 15 个镜像，
+   后端 svr 号各不相同），单个被限流或挡掉时换一个通常就能过。
+   每个批次轮换起始镜像，天然分摊压力。
+3. 通道有三条：ulist 批量（主）、clist 分页（备）、akshare（备）。
+4. 代码表四级降级：天天基金全量基金表 → 东财 clist → 新浪板块 →
+   仓库内置 data/etf_codes.txt（离线保险）。
+5. 源的选择不只"有没有数据"，还要过数据质量闸门（见 aggregate.sanity_check），
+   不合格自动换下一个源。
 
-    1) ETF 代码全表      ← 新浪 etf_hq_fund 节点（东财失败时退回 clist）
-    2) 每只 ETF 的 f62   ← 东财 ulist.np 批量取（180 只/请求，约 6 次）
-    3) 兜底              ← 东财 clist/get 分页 → akshare fund_etf_spot_em
-
-f62 = 主力净流入净额（元），正=净流入。
+口径：f62 = 主力净流入净额（元），正 = 净流入。
 """
 
 from __future__ import annotations
@@ -74,7 +78,7 @@ def _via_curl(url: str, params: dict | None, timeout: int) -> str:
 
 
 def http_get(url: str, params: dict | None = None, timeout: int = 15,
-             retries: int = 3, expect_json: bool = False) -> str:
+             retries: int = 2, expect_json: bool = False) -> str:
     """GET，返回文本；失败自动在 requests / curl 之间轮换并重试。"""
     last_err: Exception | None = None
     for attempt in range(retries):
@@ -87,26 +91,70 @@ def http_get(url: str, params: dict | None = None, timeout: int = 15,
             except Exception as exc:  # noqa: BLE001 - 换下一个通道继续试
                 last_err = exc
         if attempt < retries - 1:
-            time.sleep(2 * (attempt + 1))   # 线性退避，避免把限流打成雪崩
+            time.sleep(1.5 * (attempt + 1))   # 线性退避，别把限流打成雪崩
     raise RuntimeError(f"请求失败 {url}：{type(last_err).__name__}: {last_err}")
 
 
 # ---------------------------------------------------------------
-# 1) ETF 代码全表
+# 东财镜像主机
+# ---------------------------------------------------------------
+EM_UT = "bd1d9ddb04089700cf9c27f6f7426281"   # 东财公开 ut，缺省时大页会被截断
+
+EM_HOSTS = (
+    "push2.eastmoney.com",
+    "push2delay.eastmoney.com",      # 延时行情源，收盘 20:00 抓无影响
+    "82.push2.eastmoney.com",
+    "99.push2.eastmoney.com",
+    "1.push2.eastmoney.com",
+    "7.push2.eastmoney.com",
+    "13.push2.eastmoney.com",
+    "21.push2.eastmoney.com",
+    "29.push2.eastmoney.com",
+    "33.push2.eastmoney.com",
+    "40.push2.eastmoney.com",
+    "60.push2.eastmoney.com",
+    "70.push2.eastmoney.com",
+    "80.push2.eastmoney.com",
+    "90.push2.eastmoney.com",
+)
+EM_ULIST_PATH = "/api/qt/ulist.np/get"
+EM_CLIST_PATH = "/api/qt/clist/get"
+HOSTS_PER_REQUEST = 3       # 单个请求最多换几个镜像，避免东财整体故障时无限重试
+
+LOCAL_CODES_PATH = config.DATA_DIR / "etf_codes.txt"
+
+
+def _host_cycle(start: int) -> list[str]:
+    """从 start 开始轮转镜像：不同批次落在不同主机，天然分散压力。"""
+    n = len(EM_HOSTS)
+    return [EM_HOSTS[(start + i) % n] for i in range(n)]
+
+
+def _fetch_any_host(path: str, params: dict, start: int, timeout: int = 20,
+                    expect_json: bool = True) -> str:
+    """在镜像之间轮换着请求同一个接口，第一个成功的胜出。"""
+    last_err: Exception | None = None
+    for host in _host_cycle(start)[:HOSTS_PER_REQUEST]:
+        try:
+            return http_get(f"https://{host}{path}", params=params, timeout=timeout,
+                            retries=1, expect_json=expect_json)
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    raise RuntimeError(f"{path} 全镜像失败：{last_err}")
+
+
+# ---------------------------------------------------------------
+# 1) ETF 代码全表（四级降级）
 # ---------------------------------------------------------------
 # 天天基金「全部基金代码」js：约 2.8 万个基金，含名称，一次请求拿全。
 # 场内 ETF 用代码段过滤（沪 50/51/52/53/55/56/58 开头，深 159 开头）。
-# 这份表更新及时，A500、科创50 等新品种都在；新浪的 ETF 板块列表会漏新ETF，
-# 只作备用。表里也含大量已清盘/未上市代码，取不到资金流会自动跳过。
-EM_FUNDLIST_JS = "https://fund.eastmoney.com/js/fundcode_search.js"
+# 这份表更新及时，A500、科创50 等新品种都在；新浪的 ETF 板块列表会漏新ETF。
+EL_ETF = "https://fund.eastmoney.com/js/fundcode_search.js"
 SH_PREFIXES = ("50", "51", "52", "53", "55", "56", "58")
-
 SINA_NODE_URL = (
     "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
     "Market_Center.getHQNodeData"
 )
-EM_CLIST = "https://push2.eastmoney.com/api/qt/clist/get"
-EM_UT = "bd1d9ddb04089700cf9c27f6f7426281"   # 东财公开 ut，缺省时大页会被截断
 
 
 def _is_etf_code(code: str) -> bool:
@@ -118,9 +166,17 @@ def _secid(code: str) -> str:
     return ("0." if code.startswith("159") else "1.") + code
 
 
+def _secid_from_symbol(symbol: str) -> str:
+    """新浪 symbol（sh510300 / sz159915）→ 东财 secid（1.510300 / 0.159915）。"""
+    market = {"sh": "1", "sz": "0", "bj": "0"}.get(symbol[:2].lower())
+    if not market:
+        return ""
+    return f"{market}.{symbol[2:]}"
+
+
 def universe_from_fundlist() -> list[dict]:
-    """天天基金全量基金表 → 场内 ETF 代码表。"""
-    text = http_get(EM_FUNDLIST_JS, timeout=30, retries=2)
+    """天天基金全量基金表 → 场内 ETF 代码表（首选）。"""
+    text = http_get(EL_ETF, timeout=30, retries=2)
     match = re.search(r"\[\[.*\]\]", text, re.S)
     if not match:
         raise RuntimeError("基金代码表格式变化，未匹配到数组")
@@ -135,16 +191,43 @@ def universe_from_fundlist() -> list[dict]:
     return out
 
 
-def _secid_from_symbol(symbol: str) -> str:
-    """新浪 symbol（sh510300 / sz159915）→ 东财 secid（1.510300 / 0.159915）。"""
-    market = {"sh": "1", "sz": "0", "bj": "0"}.get(symbol[:2].lower())
-    if not market:
-        return ""
-    return f"{market}.{symbol[2:]}"
+def universe_from_eastmoney(page_size: int = 200) -> list[dict]:
+    """东财 clist 板块列表（镜像轮换）。"""
+    out: list[dict] = []
+    page, total = 1, None
+    while True:
+        text = _fetch_any_host(EM_CLIST_PATH, {
+            "pn": page, "pz": page_size, "po": 1, "np": 1, "ut": EM_UT,
+            "fltt": 2, "invt": 2, "fid": "f12",
+            # 沪市 ETF / 深市 ETF / 跨市场 ETF 等板块
+            "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
+            "fields": "f12,f13,f14",
+        }, start=page)
+        data = (json.loads(text) or {}).get("data") or {}
+        diff = data.get("diff") or []
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        if not diff:
+            break
+        if total is None:
+            total = int(data.get("total") or 0)
+        for d in diff:
+            code = str(d.get("f12") or "")
+            name = str(d.get("f14") or "").strip()
+            market = str(d.get("f13") or ("1" if code.startswith(("5", "6")) else "0"))
+            if code and name:
+                out.append({"secid": f"{market}.{code}", "code": code, "name": name})
+        if total and len(out) >= total:
+            break
+        page += 1
+        time.sleep(0.4)
+    if not out:
+        raise RuntimeError("东财 ETF 列表为空")
+    return out
 
 
 def universe_from_sina(max_pages: int = 40) -> list[dict]:
-    """新浪 ETF 板块列表，返回 [{secid, code, name}]。实测 ~930 只。"""
+    """新浪 ETF 板块列表（实测约 930 只，会漏新 ETF，只作备用）。"""
     out: list[dict] = []
     seen: set[str] = set()
     for page in range(1, max_pages + 1):
@@ -177,51 +260,49 @@ def universe_from_sina(max_pages: int = 40) -> list[dict]:
     return out
 
 
-def universe_from_eastmoney(page_size: int = 200) -> list[dict]:
-    """东财 clist 取 ETF 列表（新浪不可用时的备用）。"""
-    out: list[dict] = []
-    page, total = 1, None
-    while True:
-        text = http_get(
-            EM_CLIST,
-            params={"pn": page, "pz": page_size, "po": 1, "np": 1, "ut": EM_UT,
-                    "fltt": 2, "invt": 2, "fid": "f12",
-                    # 沪市 ETF / 深市 ETF / 跨市场 ETF 等板块
-                    "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
-                    "fields": "f12,f13,f14"},
-            timeout=20, retries=2, expect_json=True,
-        )
-        data = (json.loads(text) or {}).get("data") or {}
-        diff = data.get("diff") or []
-        if isinstance(diff, dict):
-            diff = list(diff.values())
-        if not diff:
-            break
-        if total is None:
-            total = int(data.get("total") or 0)
-        for d in diff:
-            code = str(d.get("f12") or "")
-            name = str(d.get("f14") or "").strip()
-            market = str(d.get("f13") or ("1" if code.startswith(("5", "6")) else "0"))
-            if code and name:
-                out.append({"secid": f"{market}.{code}", "code": code, "name": name})
-        if total and len(out) >= total:
-            break
-        page += 1
-        time.sleep(0.4)
+def universe_from_local() -> list[dict]:
+    """仓库内置清单（data/etf_codes.txt）：所有在线来源都失效时的离线保险。"""
+    if not LOCAL_CODES_PATH.exists():
+        raise RuntimeError("缺少 data/etf_codes.txt")
+    out = []
+    with open(LOCAL_CODES_PATH, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or not _is_etf_code(parts[0]):
+                continue
+            out.append({"secid": _secid(parts[0]), "code": parts[0],
+                        "name": "".join(parts[1:])})
     if not out:
-        raise RuntimeError("东财 ETF 列表为空")
+        raise RuntimeError("data/etf_codes.txt 内容为空")
     return out
+
+
+def save_universe(universe: list[dict]) -> None:
+    """把在线拿到的最新代码表回写本地清单，保证离线兜底不会越来越旧。"""
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOCAL_CODES_PATH, "w", encoding="utf-8") as f:
+            # 按代码排序写，内容不变时 git 就不会产生无意义的 diff
+            for item in sorted(universe, key=lambda u: u["code"]):
+                f.write(f"{item['code']} {item['name']}\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ 本地代码清单更新失败（忽略）：{exc}")
 
 
 def get_universe() -> list[dict]:
     errors = []
-    for name, fn in (("天天基金", universe_from_fundlist),
-                     ("新浪", universe_from_sina),
-                     ("东财", universe_from_eastmoney)):
+    tiers = (
+        ("天天基金", universe_from_fundlist),
+        ("东财", universe_from_eastmoney),
+        ("新浪", universe_from_sina),
+        ("本地清单", universe_from_local),
+    )
+    for name, fn in tiers:
         try:
             codes = fn()
             print(f"  ETF 代码表：{name} 共 {len(codes)} 个代码")
+            if name in ("天天基金", "东财"):
+                save_universe(codes)
             return codes
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")
@@ -230,20 +311,16 @@ def get_universe() -> list[dict]:
 
 
 # ---------------------------------------------------------------
-# 2) 主力净流入（东财 f62），批量取
+# 2) 主力净流入 f62（通道一：ulist 批量）
 # ---------------------------------------------------------------
-EM_ULIST = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 BATCH_SIZE = 180          # 一次 180 个 secid，URL 约 2KB；再长有些网关会直接掐断
-BATCH_PAUSE = 0.5         # 批次间隔，避免把风控打成雪崩
+BATCH_PAUSE = 0.4         # 批次间隔，别把风控打成雪崩
 
 
-def _flow_chunk(secids: list[str]) -> dict[str, float]:
-    text = http_get(
-        EM_ULIST,
-        params={"fltt": 2, "invt": 2, "secids": ",".join(secids),
-                "fields": "f12,f14,f62"},
-        timeout=25, retries=3, expect_json=True,
-    )
+def _flow_chunk(secids: list[str], host_start: int) -> dict[str, float]:
+    text = _fetch_any_host(EM_ULIST_PATH, {
+        "fltt": 2, "invt": 2, "secids": ",".join(secids), "fields": "f12,f14,f62",
+    }, start=host_start, timeout=15)
     data = (json.loads(text) or {}).get("data") or {}
     diff = data.get("diff") or []
     if isinstance(diff, dict):
@@ -259,25 +336,34 @@ def _flow_chunk(secids: list[str]) -> dict[str, float]:
 
 
 def fetch_eastmoney() -> list[tuple[str, float]]:
-    """主链路：代码表 + 东财 ulist 批量 f62。个别批次失败不影响整体。"""
+    """主链路：代码表 + ulist 批量。每个批次轮换镜像，个别批次失败不影响整体。"""
     universe = get_universe()
     name_by_code = {u["code"]: u["name"] for u in universe}
     codes = [u["code"] for u in universe]
 
     flow: dict[str, float] = {}
     failed = 0
+    consecutive = 0
     batches = (len(codes) + BATCH_SIZE - 1) // BATCH_SIZE
     for idx in range(batches):
         chunk = codes[idx * BATCH_SIZE:(idx + 1) * BATCH_SIZE]
         try:
-            flow.update(_flow_chunk([_secid(c) for c in chunk]))
+            flow.update(_flow_chunk([_secid(c) for c in chunk], host_start=idx))
+            consecutive = 0
         except Exception as exc:  # noqa: BLE001
             failed += 1
+            consecutive += 1
             print(f"  ⚠️ 第 {idx + 1}/{batches} 批失败（{len(chunk)} 只）：{exc}")
+            # 熔断：连续几个批次全镜像失败，说明不是抖动而是站点不可用，
+            # 别再一个批次一个批次地等超时，把时间留给下一个通道。
+            if consecutive >= 3 and not flow:
+                raise RuntimeError(
+                    f"连续 {consecutive} 个批次全部镜像失败，判定 ulist 通道不可用"
+                ) from exc
         time.sleep(BATCH_PAUSE)
 
     if not flow:
-        raise RuntimeError("东财 ulist 未返回任何资金流数据")
+        raise RuntimeError("ulist 未返回任何资金流数据")
     if failed:
         print(f"  ℹ️ {failed}/{batches} 个批次失败，已用其余批次数据继续")
 
@@ -286,19 +372,29 @@ def fetch_eastmoney() -> list[tuple[str, float]]:
     return items
 
 
+# ---------------------------------------------------------------
+# 3) 通道二：clist 分页（akshare 同款接口，部分网络会被 WAF 掐断）
+# ---------------------------------------------------------------
 def fetch_eastmoney_clist() -> list[tuple[str, float]]:
-    """备用：clist 分页（akshare 同款接口，部分网络下会被 WAF 掐断）。"""
     out: list[tuple[str, float]] = []
     page, total, page_size = 1, None, 100
+    page_fail = 0
     while True:
-        text = http_get(
-            EM_CLIST,
-            params={"pn": page, "pz": page_size, "po": 1, "np": 1, "ut": EM_UT,
-                    "fltt": 2, "invt": 2, "fid": "f12",
-                    "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
-                    "fields": "f12,f14,f62"},
-            timeout=20, retries=2, expect_json=True,
-        )
+        try:
+            text = _fetch_any_host(EM_CLIST_PATH, {
+                "pn": page, "pz": page_size, "po": 1, "np": 1, "ut": EM_UT,
+                "fltt": 2, "invt": 2, "fid": "f12",
+                "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
+                "fields": "f12,f14,f62",
+            }, start=page)
+        except Exception as exc:  # noqa: BLE001
+            page_fail += 1
+            if page_fail >= 2 or not out:
+                raise RuntimeError(f"clist 第 {page} 页全镜像失败：{exc}") from exc
+            print(f"  ⚠️ clist 第 {page} 页失败，重试一次：{exc}")
+            time.sleep(2)
+            continue
+        page_fail = 0
         data = (json.loads(text) or {}).get("data") or {}
         diff = data.get("diff") or []
         if isinstance(diff, dict):
@@ -318,12 +414,14 @@ def fetch_eastmoney_clist() -> list[tuple[str, float]]:
         page += 1
         time.sleep(0.5)
     if not out:
-        raise RuntimeError("东财 clist 未返回数据")
+        raise RuntimeError("clist 未返回数据")
     return out
 
 
+# ---------------------------------------------------------------
+# 4) 通道三：akshare 封装（未安装则自动跳过）
+# ---------------------------------------------------------------
 def fetch_akshare() -> list[tuple[str, float]]:
-    """兜底：akshare 封装（需 pip install akshare，未安装时直接跳到失败）。"""
     import akshare as ak  # noqa: PLC0415 - 延迟导入，未安装不影响主链路
 
     df = ak.fund_etf_spot_em()
@@ -345,15 +443,25 @@ SOURCES = (
 )
 
 
-def fetch_flow() -> tuple[list[tuple[str, float]], str]:
-    """按优先级依次尝试，返回 ([(ETF名称, 主力净流入元)], 命中数据源名)。"""
+def fetch_flow(validate=None) -> tuple[list[tuple[str, float]], str]:
+    """按优先级尝试各数据源，返回 ([(ETF名称, 主力净流入元)], 命中源名)。
+
+    validate(items) 用来做数据质量校验（数量、各指数命中数），抛异常即视为
+    这个源不合格，自动换下一个 —— 避免"接口能通但数据残缺"被当成成功。
+    """
     errors = []
     for name, fn in SOURCES:
         try:
             items = fn()
-            if items:
-                print(f"✅ 数据源命中：{name}（{len(items)} 只 ETF）")
-                return items, name
+            if not items:
+                raise RuntimeError("返回空数据")
+            if validate:
+                try:
+                    validate(items)
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(f"数据质量不达标：{exc}") from exc
+            print(f"✅ 数据源命中：{name}（{len(items)} 只 ETF）")
+            return items, name
         except Exception as exc:  # noqa: BLE001
             msg = f"{name} 失败：{type(exc).__name__}: {exc}"
             print(f"  ❌ {msg}")
@@ -362,28 +470,47 @@ def fetch_flow() -> tuple[list[tuple[str, float]], str]:
 
 
 # ---------------------------------------------------------------
-# 3) 最近交易日判定（不维护节假日表）
-#   拿上证指数快照里的时间戳：如果最新行情的日期不是今天，说明今天休市
-#   （节假日 / 周末），直接跳过推送，避免把昨天的数据当今天发出去。
+# 5) 最近交易日判定（不维护节假日表）
+#   读上证指数快照里的更新时间：日期不是今天，说明今天休市（周末/节假日），
+#   直接跳过推送，避免把昨天的数据当今天发出去。
+#   两个独立探测源：腾讯行情、东财 f124 时间戳。
 # ---------------------------------------------------------------
 TENCENT_QUOTE = "https://qt.gtimg.cn/q=sh000001"
 
 
-def latest_trade_date(timeout: int = 10) -> date | None:
-    """返回「最新一个已有行情的交易日」；取不到时返回 None。"""
-    try:
-        text = http_get(TENCENT_QUOTE, timeout=timeout, retries=2)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  ⚠️ 交易日探测失败（按工作日兜底）：{exc}")
-        return None
+def _probe_tencent() -> date | None:
+    text = http_get(TENCENT_QUOTE, timeout=10, retries=2)
     # v_sh000001="1~上证指数~000001~...~~20261113161427~..."
     m = re.search(r"~(\d{14})~", text)
     if not m:
         return None
-    try:
-        return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").date()
-    except ValueError:
+    return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").date()
+
+
+def _probe_eastmoney() -> date | None:
+    text = _fetch_any_host(EM_ULIST_PATH, {
+        "fltt": 2, "secids": "1.000001", "fields": "f14,f124",
+    }, start=0, timeout=10)
+    data = (json.loads(text) or {}).get("data") or {}
+    diff = data.get("diff") or []
+    if isinstance(diff, dict):
+        diff = list(diff.values())
+    if not diff or not diff[0].get("f124"):
         return None
+    return datetime.fromtimestamp(int(diff[0]["f124"]), config.CN_TZ).date()
+
+
+def latest_trade_date() -> date | None:
+    """返回「最新一个已有行情的交易日」；两个探测源都失败时返回 None。"""
+    for name, probe in (("腾讯", _probe_tencent), ("东财", _probe_eastmoney)):
+        try:
+            d = probe()
+            if d:
+                return d
+            print(f"  ⚠️ 交易日探测（{name}）返回空")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ 交易日探测（{name}）失败：{exc}")
+    return None
 
 
 def is_trading_day(today: date) -> tuple[bool, str]:
@@ -396,3 +523,47 @@ def is_trading_day(today: date) -> tuple[bool, str]:
     if lt == today:
         return True, f"最新行情日期 {lt}，正常交易日"
     return False, f"最新行情还停在 {lt}，今天休市（节假日），跳过推送"
+
+
+# ---------------------------------------------------------------
+# 6) 体检：逐个镜像 / 接口探活，方便排查"某天没推成功"
+# ---------------------------------------------------------------
+def probe() -> list[tuple[str, bool, str]]:
+    """返回 [(检查项, 是否可用, 细节)]，供 `python push.py --probe` 打印。"""
+    results: list[tuple[str, bool, str]] = []
+
+    lt = latest_trade_date()
+    results.append(("交易日探测(腾讯/东财)", lt is not None, str(lt or "两个源都没响应")))
+
+    sample = "1.510300,0.159915"
+    for host in EM_HOSTS:
+        t0 = time.time()
+        try:
+            text = http_get(f"https://{host}{EM_ULIST_PATH}",
+                            params={"fltt": 2, "secids": sample, "fields": "f14,f62"},
+                            timeout=8, retries=1, expect_json=True)
+            ok = '"f62"' in text
+            results.append((f"镜像 {host}", ok,
+                            f"{int((time.time() - t0) * 1000)}ms" if ok else "返回无 f62"))
+        except Exception as exc:  # noqa: BLE001
+            results.append((f"镜像 {host}", False, str(exc)[:70]))
+
+    for name, fn in (("代码表 天天基金", universe_from_fundlist),
+                     ("代码表 东财clist", universe_from_eastmoney),
+                     ("代码表 新浪", universe_from_sina),
+                     ("代码表 本地清单", universe_from_local)):
+        t0 = time.time()
+        try:
+            codes = fn()
+            results.append((name, bool(codes),
+                            f"{len(codes)} 条 / {int((time.time() - t0) * 1000)}ms"))
+        except Exception as exc:  # noqa: BLE001
+            results.append((name, False, str(exc)[:70]))
+
+    try:
+        import akshare  # noqa: F401,PLC0415 - 只检查是否安装
+        results.append(("akshare 兜底通道", True, "已安装，多一条独立通道"))
+    except ImportError:
+        results.append(("akshare 兜底通道", False, "未安装（pip install akshare 可再加一条）"))
+
+    return results

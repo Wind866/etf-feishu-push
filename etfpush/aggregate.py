@@ -103,3 +103,10 @@ def sanity_check(info: dict) -> None:
             f"以下指数命中的 ETF 数量异常（<{MIN_PER_INDEX} 只）：{missing}，"
             "可能是代码表不全或分类规则需要更新，本次不推送"
         )
+
+
+def evaluate(items: list[tuple[str, float]]) -> tuple[dict, dict]:
+    """聚合 + 完整性校验，返回 (stats, info)；不合格直接抛异常。"""
+    stats, info = aggregate(items)
+    sanity_check(info)
+    return stats, info

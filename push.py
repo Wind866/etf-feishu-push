@@ -43,7 +43,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--card", action="store_true", help="只发卡片消息，不发图片")
     p.add_argument("--exclude-today", action="store_true", help="图片中排除今日行")
     p.add_argument("--days", type=int, default=config.DISPLAY_DAYS, help="展示最近 N 个交易日")
+    p.add_argument("--probe", action="store_true", help="只做接口体检：镜像、代码表、兜底源能否连通")
     return p.parse_args(argv)
+
+
+def _pad(text: str, width: int) -> str:
+    """按显示宽度补空格（中文占 2 格），让体检结果对齐。"""
+    shown = sum(2 if ord(ch) > 127 else 1 for ch in text)
+    return text + " " * max(width - shown, 1)
+
+
+def _run_probe() -> int:
+    print("=== 接口体检（不做推送）===")
+    rows = sources.probe()
+    ok = sum(1 for _, good, _ in rows if good)
+    for name, good, detail in rows:
+        print(f"  {'✅' if good else '❌'} {_pad(name, 30)}{detail}")
+    print(f"\n{ok}/{len(rows)} 项可用")
+    return 0 if ok else 1
 
 
 def _print_table(hist: dict, trade_date: str, days: int) -> None:
@@ -66,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     started = _now()
     print(f"=== ETF 资金推送 · {started:%Y-%m-%d %H:%M:%S} (UTC+8) ===")
+
+    if args.probe:
+        return _run_probe()
 
     # ---------- 1. 取数 ----------
     if args.demo:
@@ -93,9 +113,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             print(f"交易日检查通过：{reason}")
 
-        items, source = sources.fetch_flow()
-        stats, info = aggregate.aggregate(items)
-        aggregate.sanity_check(info)
+        # 数据源选择带质量校验：不合格的源自动跳过，换下一个
+        items, source = sources.fetch_flow(validate=aggregate.evaluate)
+        stats, info = aggregate.evaluate(items)
         trade_date = today.strftime("%Y-%m-%d")
         print(f"统计完成（{info['total']} 个标的，剔除货币类 {info['cash_excluded']} 只、"
               f"非ETF {info['non_etf']} 只，未归类 {info['unmapped']} 只）")
