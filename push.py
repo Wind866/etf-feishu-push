@@ -128,11 +128,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚠️ 出图失败（降级为卡片）：{type(exc).__name__}: {exc}")
 
     # ---------- 3. 推送 ----------
-    if args.demo or args.dry_run or not feishu.webhook():
-        if not feishu.webhook():
-            print("ℹ️ 未配置 FEISHU_WEBHOOK，本次只做本地预览")
-        else:
-            print("ℹ️ dry-run：跳过推送")
+    if args.demo:
+        print("ℹ️ 演示模式：只出图，不推送")
+        return 0
+    if args.dry_run:
+        print("ℹ️ dry-run：跳过推送")
+        return 0
+    if not feishu.webhook():
+        print("ℹ️ 未配置 FEISHU_WEBHOOK，本次只做本地预览")
         return 0
 
     rows = history.recent_rows(hist, trade_date, args.days)
