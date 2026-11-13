@@ -554,6 +554,141 @@ def fetch_akshare() -> list[tuple[str, float]]:
     return out
 
 
+# ---------------------------------------------------------------
+# 5) 历史回补：逐只取「资金流向-日线」，一次请求拿到一整段历史
+#    （ulist 只给当日快照，没有历史；日线接口才有。）
+#    注意这个接口在 push2his 域名下，镜像跟 push2 不同。
+# ---------------------------------------------------------------
+EM_HIS_HOSTS = (
+    "push2his.eastmoney.com",
+    "1.push2his.eastmoney.com",
+    "7.push2his.eastmoney.com",
+    "82.push2his.eastmoney.com",
+    "99.push2his.eastmoney.com",
+)
+EM_FFLOW_PATH = "/api/qt/stock/fflow/daykline/get"
+# f51 日期 / f52 主力净流入 / f53 小单 / f54 中单 / f55 大单 / f56 超大单 …
+FFLOW_FIELDS = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+
+
+def _daykline(secid: str, lmt: int, start: int = 0) -> dict[str, float]:
+    """单只 ETF 的资金流日线 → {日期: 主力净流入元}。"""
+    last_err: Exception | None = None
+    for i in range(2):          # 只试 2 个镜像：被限流时多试只是白等，交给上层多轮重试
+        host = EM_HIS_HOSTS[(start + i) % len(EM_HIS_HOSTS)]
+        try:
+            text = http_get(f"https://{host}{EM_FFLOW_PATH}", params={
+                "lmt": lmt, "klt": 101, "secid": secid,
+                "fields1": "f1,f2,f3,f7", "fields2": FFLOW_FIELDS,
+            }, timeout=15, retries=1, expect_json=True)
+            data = (json.loads(text) or {}).get("data") or {}
+            out: dict[str, float] = {}
+            for line in data.get("klines") or []:
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    out[parts[0]] = float(parts[1])
+                except ValueError:
+                    continue      # 停牌日 f52 是 "-"
+            return out
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    raise RuntimeError(f"日线取数失败 {secid}：{last_err}")
+
+
+def _load_hist_cache(path) -> dict[str, dict[str, float]]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_hist_cache(path, cache: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        tmp.replace(path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ 断点文件写入失败（忽略）：{exc}")
+
+
+def fetch_history(days: int = 20, workers: int = 4, pace: float = 0.3,
+                  cache_path=None, max_passes: int = 4,
+                  refresh: bool = False) -> dict[str, list[tuple[str, float]]]:
+    """回补用：{交易日: [(ETF 名称, 主力净流入元)]}。
+
+    为什么这么小心：日线接口（push2his）的频控比实时接口严得多。
+    实测 8 并发猛拉，跑到第 368 只就被整段掐断（之后连 curl 都 rc=56，
+    要等几分钟才恢复）。所以这里：
+      * 默认 4 并发 + 每只之间 pace 秒间隔，控制在每秒几次；
+      * 断点续传：已取到的马上落盘，被封了也不会白跑；
+      * 失败的多轮重试，轮间退避，越往后等得越久。
+    """
+    import concurrent.futures as cf
+
+    universe = get_universe()
+    cache_path = cache_path or (config.DATA_DIR / ".hist_cache.json")
+    cache = {} if refresh else _load_hist_cache(cache_path)
+    if cache:
+        print(f"  断点续传：已有 {len(cache)} 只的历史缓存")
+
+    pending = [u for u in universe if u["code"] not in cache]
+    total = len(universe)
+
+    def one(item: dict):
+        time.sleep(pace + (hash(item["code"]) % 100) / 1000.0)   # 打散，别形成整齐的脉冲
+        try:
+            return item["code"], _daykline(item["secid"], lmt=days,
+                                           start=hash(item["code"]) % len(EM_HIS_HOSTS))
+        except Exception:  # noqa: BLE001 - 单只失败留到下一轮
+            return item["code"], None
+
+    for p in range(max_passes):
+        if not pending:
+            break
+        print(f"  第 {p + 1} 轮：待取 {len(pending)} 只（总 {total}）")
+        still: list[dict] = []
+        done = 0
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(one, u): u for u in pending}
+            for fut in cf.as_completed(futs):
+                code, series = fut.result()
+                done += 1
+                if series is None:
+                    still.append(futs[fut])
+                else:
+                    cache[code] = series          # 空 dict 也缓存：说明该代码本来就没数据
+                if done % 200 == 0:
+                    _save_hist_cache(cache_path, cache)
+                    print(f"    进度 {done}/{len(pending)}，已累计 {len(cache)} 只")
+        _save_hist_cache(cache_path, cache)
+        pending = still
+        if pending:
+            wait = 5 * (p + 1)
+            print(f"  ⚠️ 本轮仍有 {len(pending)} 只失败，等 {wait}s 再重试（多半是被限流）")
+            time.sleep(wait)
+
+    if pending:
+        print(f"  ℹ️ 最终 {len(pending)} 只没取到（多为已清盘/新建无数据）："
+              f"{[u['code'] for u in pending[:6]]}")
+
+    by_date: dict[str, list[tuple[str, float]]] = {}
+    for item in universe:
+        series = cache.get(item["code"]) or {}
+        for d, val in series.items():
+            by_date.setdefault(d, []).append((item["name"], val))
+    if not by_date:
+        raise RuntimeError("日线接口没有返回任何历史数据（可能正被限流，稍后重试）")
+    for d in sorted(by_date)[-3:]:
+        print(f"    {d}：{len(by_date[d])} 只")
+    return by_date
+
+
 SOURCES = (
     ("东财·批量", fetch_eastmoney),
     ("东财·分页", fetch_eastmoney_clist),
@@ -588,7 +723,7 @@ def fetch_flow(validate=None) -> tuple[list[tuple[str, float]], str]:
 
 
 # ---------------------------------------------------------------
-# 5) 最近交易日判定（不维护节假日表）
+# 6) 最近交易日判定（不维护节假日表）
 #   读上证指数快照里的更新时间：日期不是今天，说明今天休市（周末/节假日），
 #   直接跳过推送，避免把昨天的数据当今天发出去。
 #   两个独立探测源：腾讯行情、东财 f124 时间戳。
@@ -644,7 +779,7 @@ def is_trading_day(today: date) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------
-# 6) 体检：逐个镜像 / 接口探活，方便排查"某天没推成功"
+# 7) 体检：逐个镜像 / 接口探活，方便排查"某天没推成功"
 # ---------------------------------------------------------------
 def probe() -> list[tuple[str, bool, str]]:
     """返回 [(检查项, 是否可用, 细节)]，供 `python push.py --probe` 打印。"""

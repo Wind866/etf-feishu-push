@@ -12,3 +12,7 @@ snapshots/
 # 本机调试
 *.log
 .DS_Store
+
+# 历史回补的断点缓存（临时文件，不进仓库）
+data/.hist_cache.json
+data/.hist_cache.tmp

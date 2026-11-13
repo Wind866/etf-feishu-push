@@ -9,10 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'normal=抓当日并推送 / demo=用演示数据出图（不推送） / preview=抓数出图但不推送'
+        description: 'normal=抓当日并推送 / demo=演示数据出图 / preview=抓数出图不推送 / backfill=回补历史（不推送）'
         type: choice
         default: normal
-        options: [normal, demo, preview]
+        options: [normal, demo, preview, backfill]
+      days:
+        description: '仅 backfill 用：回补最近几个交易日'
+        type: string
+        default: '10'
 
 permissions:
   contents: write          # 需要把 data/history.json 提交回仓库，才能累积多日对照
@@ -24,7 +28,7 @@ concurrency:
 jobs:
   push:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30          # 回补历史需要逐只取日线，留足余量
 
     steps:
       - name: Checkout
@@ -69,9 +73,10 @@ jobs:
         run: |
           MODE="${{ inputs.mode }}"
           case "$MODE" in
-            demo)    python push.py --demo ;;
-            preview) python push.py --dry-run ;;
-            *)       python push.py ;;
+            demo)     python push.py --demo ;;
+            preview)  python push.py --dry-run ;;
+            backfill) python backfill.py --days "${{ inputs.days }}" ;;
+            *)        python push.py ;;
           esac
 
       - name: Upload snapshot (debug)
