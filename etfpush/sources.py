@@ -124,21 +124,41 @@ HOSTS_PER_REQUEST = 3       # 单个请求最多换几个镜像，避免东财�
 LOCAL_CODES_PATH = config.DATA_DIR / "etf_codes.txt"
 
 
+# 镜像健康分：失败 +1、成功 -1（下限 0）。
+# runner 上实测有些镜像会间歇性返回空响应，把它们的优先级压下去，
+# 后面的批次就自动避开，而不是每批都先撞一遍坏主机。
+_HOST_FAILS: dict[str, int] = {}
+
+
+def _mark_host(host: str, ok: bool) -> None:
+    if ok:
+        _HOST_FAILS[host] = max(0, _HOST_FAILS.get(host, 0) - 1)
+    else:
+        _HOST_FAILS[host] = min(9, _HOST_FAILS.get(host, 0) + 1)
+
+
 def _host_cycle(start: int) -> list[str]:
-    """从 start 开始轮转镜像：不同批次落在不同主机，天然分散压力。"""
+    """按「健康分升序 + 轮转偏移」排序：好主机优先，压力仍分散在各主机。"""
     n = len(EM_HOSTS)
-    return [EM_HOSTS[(start + i) % n] for i in range(n)]
+    order = sorted(
+        range(n),
+        key=lambda i: (_HOST_FAILS.get(EM_HOSTS[i], 0), (i - start) % n),
+    )
+    return [EM_HOSTS[i] for i in order]
 
 
 def _fetch_any_host(path: str, params: dict, start: int, timeout: int = 20,
-                    expect_json: bool = True) -> str:
+                    expect_json: bool = True, tries: int = HOSTS_PER_REQUEST) -> str:
     """在镜像之间轮换着请求同一个接口，第一个成功的胜出。"""
     last_err: Exception | None = None
-    for host in _host_cycle(start)[:HOSTS_PER_REQUEST]:
+    for host in _host_cycle(start)[:tries]:
         try:
-            return http_get(f"https://{host}{path}", params=params, timeout=timeout,
+            text = http_get(f"https://{host}{path}", params=params, timeout=timeout,
                             retries=1, expect_json=expect_json)
+            _mark_host(host, True)
+            return text
         except Exception as exc:  # noqa: BLE001
+            _mark_host(host, False)
             last_err = exc
     raise RuntimeError(f"{path} 全镜像失败：{last_err}")
 
@@ -289,7 +309,14 @@ def save_universe(universe: list[dict]) -> None:
         print(f"  ⚠️ 本地代码清单更新失败（忽略）：{exc}")
 
 
+_UNIVERSE: list[dict] | None = None
+
+
 def get_universe() -> list[dict]:
+    """ETF 代码表（四级降级），结果在进程内缓存，避免闸门校验时重复抓。"""
+    global _UNIVERSE
+    if _UNIVERSE:
+        return _UNIVERSE
     errors = []
     tiers = (
         ("天天基金", universe_from_fundlist),
@@ -303,6 +330,7 @@ def get_universe() -> list[dict]:
             print(f"  ETF 代码表：{name} 共 {len(codes)} 个代码")
             if name in ("天天基金", "东财"):
                 save_universe(codes)
+            _UNIVERSE = codes
             return codes
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")
@@ -310,11 +338,37 @@ def get_universe() -> list[dict]:
     raise RuntimeError("ETF 代码表全部获取失败\n" + "\n".join(errors))
 
 
+def expected_counts() -> dict[str, int] | None:
+    """代码表里各宽基指数各有几只 ETF，供质量闸门做「相对」判定。
+
+    绝对只数不能当标准：全市场上证50 只有 11 只，抓到 5 只可能只是漏了一批，
+    抓到 0 只才是规则/代码表坏了。所以按「占代码表的比例」判断更准。
+    """
+    from .aggregate import classify      # 延迟导入：aggregate 只依赖 config，不会循环
+
+    try:
+        universe = get_universe()
+    except Exception:  # noqa: BLE001
+        return None
+    out: dict[str, int] = {}
+    for item in universe:
+        col = classify(item["name"])
+        if col:
+            out[col] = out.get(col, 0) + 1
+    return out or None
+
+
 # ---------------------------------------------------------------
 # 2) 主力净流入 f62（通道一：ulist 批量）
 # ---------------------------------------------------------------
 BATCH_SIZE = 180          # 一次 180 个 secid，URL 约 2KB；再长有些网关会直接掐断
 BATCH_PAUSE = 0.4         # 批次间隔，别把风控打成雪崩
+MIN_SPLIT_SIZE = 24       # 二分重试的下限：再小就不值得拆了
+MAX_SPLIT_DEPTH = 2       # 180 → 90 → 45，最多拆两层
+FILL_CHUNK = 60           # 补抓时每条 URL 的代码数（更短，成功率更高）
+FILL_PAUSE = 1.0
+FILL_ROUNDS = 2           # 主循环结束后再补抓几轮
+FETCH_BUDGET = 420        # 单个通道的总时间预算（秒），超出就带着现有数据走
 
 
 def _flow_chunk(secids: list[str], host_start: int) -> dict[str, float]:
@@ -335,8 +389,66 @@ def _flow_chunk(secids: list[str], host_start: int) -> dict[str, float]:
     return out
 
 
+def _flow_batch(secids: list[str], host_start: int, depth: int = 0) -> dict[str, float]:
+    """整批取；失败就二分重试。
+
+    实测 runner 上偶尔会整批返回空响应（网关对大 URL 掐连接），
+    但同一批拆成两半后通常都能过 —— 所以失败不要直接丢，先拆。
+    """
+    try:
+        return _flow_chunk(secids, host_start)
+    except Exception as exc:  # noqa: BLE001
+        if len(secids) <= MIN_SPLIT_SIZE or depth >= MAX_SPLIT_DEPTH:
+            raise
+        mid = len(secids) // 2
+        print(f"  ↳ {len(secids)} 只的批次失败，拆成 {mid}+{len(secids) - mid} 重试：{exc}")
+        out: dict[str, float] = {}
+        last_err: Exception | None = None
+        for part in (secids[:mid], secids[mid:]):
+            try:
+                out.update(_flow_batch(part, host_start + 1, depth + 1))
+            except Exception as exc2:  # noqa: BLE001
+                last_err = exc2
+            time.sleep(BATCH_PAUSE)
+        if not out:
+            raise (last_err or exc)
+        return out
+
+
+def _fill_missing(codes: list[str], flow: dict[str, float], deadline: float) -> None:
+    """主循环里失败的批次会留下缺口，这里只补缺的那部分，直到补不动为止。
+
+    注意缺口有两种：失败批次漏掉的（补得回来），和已清盘/未上市代码
+    （永远没有 f62）。所以补一轮没捞回多少就收手，别白跑第二轮。
+    """
+    for rnd in range(FILL_ROUNDS):
+        missing = [c for c in codes if c not in flow]
+        if not missing or time.time() > deadline:
+            return
+        before = len(missing)
+        print(f"  🔁 补抓第 {rnd + 1} 轮：{len(missing)} 只还没取到")
+        for i in range(0, len(missing), FILL_CHUNK):
+            if time.time() > deadline:
+                print("  ⏹ 时间预算用完，停止补抓（用现有数据继续）")
+                return
+            part = missing[i:i + FILL_CHUNK]
+            try:
+                flow.update(_flow_batch([_secid(c) for c in part],
+                                        host_start=rnd * 5 + i // FILL_CHUNK))
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ⚠️ 补抓 {len(part)} 只失败：{exc}")
+            time.sleep(FILL_PAUSE)
+        recovered = before - len([c for c in codes if c not in flow])
+        print(f"     本轮补回 {recovered} 只")
+        if recovered < before * 0.15:
+            print("     补回比例太低，剩下的应已清盘/未上市，停止补抓")
+            return
+
+
 def fetch_eastmoney() -> list[tuple[str, float]]:
-    """主链路：代码表 + ulist 批量。每个批次轮换镜像，个别批次失败不影响整体。"""
+    """主链路：代码表 + ulist 批量（失败二分重试 + 缺号补抓）。"""
+    t0 = time.time()
+    deadline = t0 + FETCH_BUDGET
     universe = get_universe()
     name_by_code = {u["code"]: u["name"] for u in universe}
     codes = [u["code"] for u in universe]
@@ -348,13 +460,13 @@ def fetch_eastmoney() -> list[tuple[str, float]]:
     for idx in range(batches):
         chunk = codes[idx * BATCH_SIZE:(idx + 1) * BATCH_SIZE]
         try:
-            flow.update(_flow_chunk([_secid(c) for c in chunk], host_start=idx))
+            flow.update(_flow_batch([_secid(c) for c in chunk], host_start=idx))
             consecutive = 0
         except Exception as exc:  # noqa: BLE001
             failed += 1
             consecutive += 1
             print(f"  ⚠️ 第 {idx + 1}/{batches} 批失败（{len(chunk)} 只）：{exc}")
-            # 熔断：连续几个批次全镜像失败，说明不是抖动而是站点不可用，
+            # 熔断：连续几个批次（含二分重试）全失败，说明不是抖动而是站点不可用，
             # 别再一个批次一个批次地等超时，把时间留给下一个通道。
             if consecutive >= 3 and not flow:
                 raise RuntimeError(
@@ -365,10 +477,16 @@ def fetch_eastmoney() -> list[tuple[str, float]]:
     if not flow:
         raise RuntimeError("ulist 未返回任何资金流数据")
     if failed:
-        print(f"  ℹ️ {failed}/{batches} 个批次失败，已用其余批次数据继续")
+        print(f"  ℹ️ {failed}/{batches} 个批次初期失败，进入补抓")
+
+    _fill_missing(codes, flow, deadline)
 
     items = [(name_by_code[c], v) for c, v in flow.items() if c in name_by_code]
-    print(f"  东财批量：{len(items)} 只有资金流数据（代码表共 {len(codes)} 个代码）")
+    cover = len(items) / max(len(codes), 1)
+    print(f"  东财批量：{len(items)}/{len(codes)} 个代码有资金流（覆盖 {cover:.0%}，"
+          f"耗时 {time.time() - t0:.0f}s）")
+    if cover < 0.6:
+        raise RuntimeError(f"覆盖度过低（{cover:.0%}），判定本通道数据不可信")
     return items
 
 

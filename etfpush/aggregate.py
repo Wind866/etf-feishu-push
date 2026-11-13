@@ -85,11 +85,17 @@ def rounded(stats: dict) -> dict:
 
 
 # 数据完整性闸门：宁可这一次不推，也不要把残缺数据发到群里
-MIN_ETFS_TOTAL = 400      # 全市场 ETF 数量下限（当前约 1600 只有资金流）
-MIN_PER_INDEX = 3         # 每个宽基指数至少要有几只 ETF 命中
+MIN_ETFS_TOTAL = 1200     # 全市场 ETF 数量下限（正常情况下约 1830 只有资金流）
+MIN_PER_INDEX = 3         # 没有基准时的保底：每个宽基至少要几只 ETF
+MIN_INDEX_RATIO = 0.6     # 有基准时：每个指数至少抓到代码表里 60% 的只数
 
 
-def sanity_check(info: dict) -> None:
+def sanity_check(info: dict, expected: dict | None = None) -> None:
+    """expected: {指数: 代码表里该指数的 ETF 只数}，用来做相对判定。
+
+    为什么不用绝对只数：全市场上证50 只有 11 只 ETF，抓到 2 只可能是漏了一批，
+    但只要抓到 0 只就一定是规则或代码表坏了 —— 用比例判才不会误杀。
+    """
     counts = info.get("counts", {})
     total = counts.get("所有ETF", 0)
     if total < MIN_ETFS_TOTAL:
@@ -97,16 +103,23 @@ def sanity_check(info: dict) -> None:
             f"抓到的 ETF 只有 {total} 只，少于下限 {MIN_ETFS_TOTAL}，"
             "判定为数据不完整，本次不推送"
         )
-    missing = {c: counts.get(c, 0) for c in config.COLUMNS[1:] if counts.get(c, 0) < MIN_PER_INDEX}
-    if missing:
+    bad = {}
+    for col in config.COLUMNS[1:]:
+        got = counts.get(col, 0)
+        need = MIN_PER_INDEX
+        if expected and expected.get(col):
+            need = max(MIN_PER_INDEX, round(expected[col] * MIN_INDEX_RATIO))
+        if got < need:
+            bad[col] = f"{got}/{expected.get(col, '?') if expected else '?'} 只，需 ≥{need}"
+    if bad:
         raise RuntimeError(
-            f"以下指数命中的 ETF 数量异常（<{MIN_PER_INDEX} 只）：{missing}，"
-            "可能是代码表不全或分类规则需要更新，本次不推送"
+            f"以下指数命中的 ETF 数量异常：{bad}，"
+            "可能是漏抓批次或代码表不全，本次不推送"
         )
 
 
-def evaluate(items: list[tuple[str, float]]) -> tuple[dict, dict]:
+def evaluate(items: list[tuple[str, float]], expected: dict | None = None) -> tuple[dict, dict]:
     """聚合 + 完整性校验，返回 (stats, info)；不合格直接抛异常。"""
     stats, info = aggregate(items)
-    sanity_check(info)
+    sanity_check(info, expected)
     return stats, info

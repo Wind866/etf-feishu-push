@@ -113,9 +113,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             print(f"交易日检查通过：{reason}")
 
-        # 数据源选择带质量校验：不合格的源自动跳过，换下一个
-        items, source = sources.fetch_flow(validate=aggregate.evaluate)
-        stats, info = aggregate.evaluate(items)
+        # 数据源选择带质量校验：不合格的源自动跳过，换下一个。
+        # expected 是代码表里各指数的真实只数，让闸门按比例判而不是绝对只数。
+        validate = lambda its: aggregate.evaluate(its, sources.expected_counts())  # noqa: E731
+        items, source = sources.fetch_flow(validate=validate)
+        stats, info = validate(items)
         trade_date = today.strftime("%Y-%m-%d")
         print(f"统计完成（{info['total']} 个标的，剔除货币类 {info['cash_excluded']} 只、"
               f"非ETF {info['non_etf']} 只，未归类 {info['unmapped']} 只）")
