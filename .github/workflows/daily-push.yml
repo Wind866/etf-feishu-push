@@ -105,6 +105,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/history.json data/etf_codes.txt
+          # 回补模式：把断点缓存也强制提交回去（.gitignore 里默认忽略它）。
+          # 这是「回补一直成功不了」的根因修复——push2his 频控严，单次跑不完 1800 只，
+          # 缓存不落库下次就冷启动重头再来，永远凑不满 1200 只的闸门。
+          # 强制入库后，每次手动 backfill 都能从上次进度续传，直到全部补齐。
+          if [ "${{ inputs.mode }}" = "backfill" ]; then
+            git add -f data/.hist_cache.json 2>/dev/null || true
+          fi
           if git diff --cached --quiet; then
             echo "无变化，跳过提交"
             exit 0

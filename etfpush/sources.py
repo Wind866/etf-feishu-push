@@ -559,11 +559,23 @@ def fetch_akshare() -> list[tuple[str, float]]:
 #    （ulist 只给当日快照，没有历史；日线接口才有。）
 #    注意这个接口在 push2his 域名下，镜像跟 push2 不同。
 # ---------------------------------------------------------------
+# 日线接口（push2his）的频控比实时接口严得多：实测猛拉到 ~368 只就会被整段
+# 掐断（之后连 curl 都 rc=56，要等几分钟才恢复）。多铺几个镜像，没被封的镜像
+# 仍能出货，被封的那批靠「断点续传 + 跨次运行」慢慢补齐。
 EM_HIS_HOSTS = (
     "push2his.eastmoney.com",
     "1.push2his.eastmoney.com",
     "7.push2his.eastmoney.com",
+    "13.push2his.eastmoney.com",
+    "21.push2his.eastmoney.com",
+    "29.push2his.eastmoney.com",
+    "33.push2his.eastmoney.com",
+    "40.push2his.eastmoney.com",
+    "60.push2his.eastmoney.com",
+    "70.push2his.eastmoney.com",
+    "80.push2his.eastmoney.com",
     "82.push2his.eastmoney.com",
+    "90.push2his.eastmoney.com",
     "99.push2his.eastmoney.com",
 )
 EM_FFLOW_PATH = "/api/qt/stock/fflow/daykline/get"
@@ -574,7 +586,7 @@ FFLOW_FIELDS = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
 def _daykline(secid: str, lmt: int, start: int = 0) -> dict[str, float]:
     """单只 ETF 的资金流日线 → {日期: 主力净流入元}。"""
     last_err: Exception | None = None
-    for i in range(2):          # 只试 2 个镜像：被限流时多试只是白等，交给上层多轮重试
+    for i in range(3):          # 试 3 个镜像：多铺了镜像后，多试能多救回一些被封的请求
         host = EM_HIS_HOSTS[(start + i) % len(EM_HIS_HOSTS)]
         try:
             text = http_get(f"https://{host}{EM_FFLOW_PATH}", params={
@@ -617,8 +629,8 @@ def _save_hist_cache(path, cache: dict) -> None:
         print(f"  ⚠️ 断点文件写入失败（忽略）：{exc}")
 
 
-def fetch_history(days: int = 20, workers: int = 4, pace: float = 0.3,
-                  cache_path=None, max_passes: int = 4,
+def fetch_history(days: int = 20, workers: int = 3, pace: float = 0.4,
+                  cache_path=None, max_passes: int = 5,
                   refresh: bool = False) -> dict[str, list[tuple[str, float]]]:
     """回补用：{交易日: [(ETF 名称, 主力净流入元)]}。
 
@@ -663,7 +675,7 @@ def fetch_history(days: int = 20, workers: int = 4, pace: float = 0.3,
                     still.append(futs[fut])
                 else:
                     cache[code] = series          # 空 dict 也缓存：说明该代码本来就没数据
-                if done % 200 == 0:
+                if done % 100 == 0:
                     _save_hist_cache(cache_path, cache)
                     print(f"    进度 {done}/{len(pending)}，已累计 {len(cache)} 只")
         _save_hist_cache(cache_path, cache)
@@ -674,8 +686,10 @@ def fetch_history(days: int = 20, workers: int = 4, pace: float = 0.3,
             time.sleep(wait)
 
     if pending:
-        print(f"  ℹ️ 最终 {len(pending)} 只没取到（多为已清盘/新建无数据）："
-              f"{[u['code'] for u in pending[:6]]}")
+        print(f"  ℹ️ 断点缓存累计 {len(cache)}/{total} 只；最终仍有 {len(pending)} 只没取到"
+              f"（多为已清盘/新建无数据）：{[u['code'] for u in pending[:6]]}")
+    else:
+        print(f"  ✅ 断点缓存累计 {len(cache)}/{total} 只，本次全部取齐")
 
     by_date: dict[str, list[tuple[str, float]]] = {}
     for item in universe:
