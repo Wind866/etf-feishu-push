@@ -175,10 +175,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------- 4. 记录推送状态 ----------
     if not (args.demo or args.no_fetch or args.dry_run):
-        stats = hist["records"][trade_date]
-        hist = history.mark_pushed(hist, trade_date, stats, started.strftime("%H:%M:%S"))
-        history.save(hist)
-        print("📝 已记录推送状态（同日重复运行会自动跳过）")
+        if trade_date in hist.get("records", {}):
+            stats = hist["records"][trade_date]
+            hist = history.mark_pushed(hist, trade_date, stats, started.strftime("%H:%M:%S"))
+            history.save(hist)
+            print("📝 已记录推送状态（同日重复运行会自动跳过）")
+        else:
+            # --force 在周末/节假日强推时，该交易日记录会被 prune_weekend 清理，
+            # 这里不应再按 trade_date 取记录，否则 KeyError 把整个任务判成失败、
+            # 还误发一条失败告警。图片/卡片已经发出去了，只是不写推送台账。
+            print(f"ℹ️ {trade_date} 未写入历史（被周末清理或未通过校验），跳过推送状态记录")
 
     print(f"=== 完成，用时 {(_now() - started).seconds}s ===")
     return 0
