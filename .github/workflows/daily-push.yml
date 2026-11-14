@@ -3,8 +3,10 @@ name: ETF 资金流向 · 每交易日 20:00 推送飞书
 on:
   schedule:
     # GitHub 的 cron 走 UTC：12:00 UTC = 北京时间 20:00，周一至周五。
-    # 注意两点：① cron 只能表达「周一~周五」，遇到 A 股节假日由脚本内的
-    # 交易日探测自动跳过；② 公共 runner 排队时可能推迟几分钟。
+    # 准点由 Cloudflare Worker（见 BIGApush/cloudflare/README.md）workflow_dispatch；
+    # GitHub cron 只作兜底 —— 同账号实测延迟 3~10 小时甚至丢弃档期。
+    # 脚本自带 history.json 交易日判重，两个触发器不会重复推送。
+    # 遇到 A 股节假日由脚本内的交易日探测自动跳过。
     - cron: '0 12 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -17,9 +19,14 @@ on:
         description: '仅 backfill 用：回补最近几个交易日'
         type: string
         default: '10'
+      force:
+        description: '交易日已推过相同数据也强制重推'
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # 需要把 data/history.json 提交回仓库，才能累积多日对照
+  actions: read
 
 concurrency:
   group: etf-flow-push
@@ -66,6 +73,7 @@ jobs:
       - name: Run
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          # FEISHU_SECRET 可选：仅当飞书机器人开启「签名校验」时才需要在 Secrets 里配置
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
@@ -76,7 +84,7 @@ jobs:
             demo)     python push.py --demo ;;
             preview)  python push.py --dry-run ;;
             backfill) python backfill.py --days "${{ inputs.days }}" ;;
-            *)        python push.py ;;
+            *)        if [ "${{ inputs.force }}" = "true" ]; then python push.py --force; else python push.py; fi ;;
           esac
 
       - name: Upload snapshot (debug)
@@ -88,12 +96,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # 只在成功且确实会写 history 的模式下回写：
+      # 旧版 if: always() 会把失败/取消时的不完整数据也提交，且 git push 的二次报错
+      # 会掩盖真正的失败原因。preview/demo 不写库，也不该走提交。
       - name: Commit history
-        if: always() && inputs.mode != 'demo'
+        if: success() && (github.event_name == 'schedule' || inputs.mode == '' || inputs.mode == 'normal' || inputs.mode == 'backfill')
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # history.json 存每日汇总，etf_codes.txt 是离线兜底用的代码清单
           git add data/history.json data/etf_codes.txt
           if git diff --cached --quiet; then
             echo "无变化，跳过提交"
@@ -102,3 +112,16 @@ jobs:
           git commit -m "chore(data): ETF 历史 $(date +%Y-%m-%d)"
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
           git push origin HEAD:"${GITHUB_REF_NAME}"
+
+      - name: 失败告警
+        if: failure()
+        env:
+          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          HOOK="${ALERT_WEBHOOK:-$FEISHU_WEBHOOK}"
+          if [ -z "$HOOK" ]; then echo "未配置告警 webhook，跳过失败告警"; exit 0; fi
+          curl -sS -X POST "$HOOK" -H "Content-Type: application/json" \
+            -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"⚠️ ETF 资金流向任务运行失败，请查看日志：$RUN_URL\"}}" \
+            >/dev/null || true
