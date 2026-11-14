@@ -21,6 +21,12 @@ import sys
 
 from etfpush import aggregate, config, history, sources
 
+# 回补用的「宽松闸门下限」：历史补全优先于当日严格闸门（1200）。
+# 只要某天拿到 >=900 只 ETF 的主力净流入，就先记进去（仅供参考），
+# 避免「差几只就整天空跑、永远写不进 history.json」的死循环。
+# 当日严格推送（push.py）仍走 aggregate.MIN_ETFS_TOTAL=1200，不受影响。
+BACKFILL_MIN_ETFS = 900
+
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="回补最近 N 个交易日的 ETF 资金流历史")
@@ -42,32 +48,38 @@ def main(argv=None) -> int:
     print(f"=== 历史回补 · 目标最近 {args.days} 个交易日 ===")
 
     # 多取一些日子再截断：长假 / 停牌会让实际交易日比日历天数少
-    expect = sources.expected_counts()
     flows = sources.fetch_history(days=max(args.days * 2, 24), workers=args.workers,
                                   pace=args.pace, refresh=args.refresh)
     dates = sorted(flows)[-args.days:]
 
     hist = history.load()
-    written, skipped, bad = 0, 0, 0
+    written, skipped, incomplete = 0, 0, 0
     for d in dates:
         if d in hist.get("records", {}) and not args.force:
             print(f"⏭  {d} 已有记录，跳过（--force 可覆盖）")
             skipped += 1
             continue
-        try:
-            stats, info = aggregate.evaluate(flows[d], expect)
-        except Exception as exc:  # noqa: BLE001
-            print(f"⚠️ {d} 数据不完整，跳过：{exc}")
-            bad += 1
-            continue
-        hist = history.upsert(hist, d, stats)
+        rows = flows[d]
+        stats, info = aggregate.aggregate(rows)
         total = info["counts"]["所有ETF"]
+        if total < BACKFILL_MIN_ETFS:
+            print(f"⚠️ {d} 仅 {total} 只 ETF（<{BACKFILL_MIN_ETFS}），数据不完整，"
+                  f"暂跳过；继续回补后再次运行本脚本即可补上")
+            incomplete += 1
+            continue
+        if total < aggregate.MIN_ETFS_TOTAL:
+            print(f"⚠️ {d} 仅 {total} 只 ETF（低于当日严格值 {aggregate.MIN_ETFS_TOTAL}），"
+                  f"仍写入（历史补全，仅供参考）")
+        hist = history.upsert(hist, d, stats)
         print(f"✅ {d} 写入：{total} 只 ETF，所有ETF {stats['所有ETF']:+.2f} 亿")
         written += 1
 
     hist = history.prune_weekend(hist)
     history.save(hist)
-    print(f"\n完成：写入 {written} 天，跳过 {skipped} 天，数据不合格 {bad} 天")
+    print(f"\n完成：写入 {written} 天，跳过 {skipped} 天，不完整（需再跑）{incomplete} 天")
+    if incomplete:
+        print("提示：仍有不完整日期，多半是 push2his 被限流。断点缓存已自动保留，"
+              "再次手动触发一次 backfill（workflow_dispatch，mode=backfill）即可从上次进度续传。")
     print(f"存档：{config.HISTORY_PATH.relative_to(config.ROOT)}（共 "
           f"{len(hist.get('records', {}))} 天）")
 
