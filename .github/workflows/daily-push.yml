@@ -72,7 +72,15 @@ jobs:
       - name: Validate config
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          INPUT_MODE: ${{ inputs.mode }}
         run: |
+          # demo/preview/backfill 只出图、不推送飞书，无需 webhook；
+          # 仅 normal（含 schedule / repository_dispatch / 手动默认路径）才要求配置。
+          case "${INPUT_MODE:-normal}" in
+            demo|preview|backfill)
+              echo "模式 ${INPUT_MODE} 不推送飞书，跳过 FEISHU_WEBHOOK 校验"
+              exit 0 ;;
+          esac
           if [ -z "$FEISHU_WEBHOOK" ]; then
             echo "::error::缺少 FEISHU_WEBHOOK，请在 Settings → Secrets and variables → Actions 中配置"
             exit 1
