@@ -14,6 +14,18 @@
     python push.py --force            # 忽略「今日非交易日」与「同日已推」判断
     python push.py --card             # 不推图片，改推卡片
     python push.py --exclude-today    # 图片不含今天（只发历史）
+
+关于「多数据源」的说明（重要，别被三条通道的名字骗了）
+--------------------------------------------------------
+`sources.SOURCES` 里的三条通道（东财·批量 / 东财·分页 / akshare·东财）以及
+15 个镜像，**全部指向东方财富同一家**：三个 fetch_* 函数打的是同一套
+push2/push2his 接口，镜像只是同一集群的不同 svr 域名。所以「东财整体封 IP」
+（你们自己的排查记录里写过「5 分钟以上所有接口不可用」）时，三条会一起失效。
+
+这是指标本身的客观限制：ETF 主力净流入只有东财提供，换别家等于换口径。
+因此这里的降级路径不是「再找一个源」，而是**T+1 回补**：当天全挂时本次
+照实失败并告警，第二天的日线接口（fetch_history）能把这一天的数补回来，
+10 日对照表不会永久缺一格 —— 见 `_auto_backfill()`。
 """
 
 from __future__ import annotations
@@ -22,7 +34,7 @@ import argparse
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from etfpush import aggregate, config, feishu, history, render, sources
 
@@ -77,6 +89,41 @@ def _print_table(hist: dict, trade_date: str, days: int) -> None:
             cells.append(f"{float(val):>12.2f}" if isinstance(val, (int, float)) else f"{'-':>12}")
         print(f"{date_txt + ('*' if is_today else ' '):<8}" + "".join(cells))
     print()
+
+
+def _auto_backfill(hist: dict, trade_date: str) -> None:
+    """历史不足或有缺口时，顺手补一轮（**推送成功之后**才调用）。
+
+    新仓库上线后 history.json 只有当天一条：10 日对照表要干等两周才长出来；
+    中途某天被东财限流漏推，那张表也会永久缺一格。指望人记得去点
+    workflow_dispatch(mode=backfill) 并不现实，所以这里自动补：
+
+      * 触发条件：最近 20 个自然日内的记录数 < DISPLAY_DAYS（刚开始积累、或有缺口）；
+      * 补齐即停：凑够 DISPLAY_DAYS 天后这个函数什么都不做；
+      * 复用 backfill.py 的断点缓存与 1200 只口径闸门，补出来的数与当日推送同口径。
+
+    必须放在「推送成功、推送状态已写」之后：补历史是锦上添花，不能因为它
+    失败就把当天的推送判成失败 —— 所有异常都在这里吞掉并记录。
+    """
+    if os.environ.get("AUTO_BACKFILL", "1").strip() == "0":
+        print("ℹ️ AUTO_BACKFILL=0，跳过多日历史自动回补")
+        return
+    try:
+        since = (datetime.strptime(trade_date, "%Y-%m-%d")
+                 - timedelta(days=20)).strftime("%Y-%m-%d")
+    except ValueError:
+        return
+    have = sum(1 for d in (hist.get("records") or {}) if d >= since)
+    if have >= config.DISPLAY_DAYS:
+        return
+    print(f"🧩 近 20 天只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史，自动回补一次…")
+    try:
+        import backfill  # noqa: PLC0415 - 日常推送不需要它，延迟导入
+        backfill.main(["--days", str(config.DISPLAY_DAYS)])
+    except SystemExit as exc:
+        print(f"⚠️ 自动回补提前结束（exit={exc.code}），历史可能仍不完整")
+    except Exception as exc:  # noqa: BLE001 - 绝不能影响已完成的推送
+        print(f"⚠️ 自动回补失败（不影响本次推送）：{type(exc).__name__}: {exc}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -194,6 +241,12 @@ def main(argv: list[str] | None = None) -> int:
             # 这里不应再按 trade_date 取记录，否则 KeyError 把整个任务判成失败、
             # 还误发一条失败告警。图片/卡片已经发出去了，只是不写推送台账。
             print(f"ℹ️ {trade_date} 未写入历史（被周末清理或未通过校验），跳过推送状态记录")
+
+    # ---------- 4.5 历史自愈（可选，失败不影响本次推送） ----------
+    # 放在最后：此时飞书已经收到消息、推送状态也已落库，补历史出任何问题
+    # 都只是「表里少一天」，不该把整次运行判成失败。
+    if not (args.demo or args.no_fetch or args.dry_run):
+        _auto_backfill(history.load(), trade_date)
 
     print(f"=== 完成，用时 {(_now() - started).seconds}s ===")
     return 0

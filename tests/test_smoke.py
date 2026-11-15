@@ -32,9 +32,15 @@ class TestPythonSyntax(unittest.TestCase):
 
 
 class TestDependencies(unittest.TestCase):
-    """上游 breaking change 会直接打断每日 20:00 的推送，所有依赖都要有主版本上界。"""
+    """上游 breaking change 会直接打断每日 20:00 的推送。
 
-    def test_requirements_have_upper_bounds(self):
+    所以每个依赖都必须「不会自动跨大版本漂移」：要么写上界（`<2`），
+    要么直接钉死到具体版本（`==1.20.42`）。akshare 这种会改列名的库
+    必须用后者 —— fund_etf_spot_em() 的 `主力净流入-净额` 是硬约定，
+    只写上界等于允许它在下个小版本里把兜底通道悄悄改坏。
+    """
+
+    def test_requirements_are_pinned(self):
         for name in ("requirements.txt", "requirements-optional.txt"):
             path = os.path.join(ROOT, name)
             if not os.path.exists(path):
@@ -44,7 +50,7 @@ class TestDependencies(unittest.TestCase):
                     line = line.split("#", 1)[0].strip()
                     if not line or line.startswith("-"):
                         continue
-                    self.assertRegex(line, r"<", f"{name} 缺少版本上界：{line}")
+                    self.assertRegex(line, r"(<|==)", f"{name} 既没上界也没钉版本：{line}")
 
     def test_requirements_files_exist(self):
         self.assertTrue(os.path.exists(os.path.join(ROOT, "requirements.txt")))
