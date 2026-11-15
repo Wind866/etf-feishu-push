@@ -2,8 +2,15 @@ name: CI · 语法 / 单元 / 配置
 
 on:
   pull_request:
+  # 旧写法 branches-ignore: [main] 等于生产分支零校验：本仓库的改动基本
+  # 都是直接提交到 main，bot 每天也会回写 data/history.json。改成按路径触发，
+  # 只有代码 / 配置 / 工作流变更才跑门禁，纯数据提交不占用 CI。
   push:
-    branches-ignore: [main]
+    paths:
+      - '**.py'
+      - 'requirements*.txt'
+      - '.github/**'
+      - 'README.md'
   workflow_dispatch:
 
 permissions:
@@ -61,3 +68,38 @@ jobs:
             exit 1
           fi
           echo "全部 Action 已固定到 commit SHA"
+
+      # workflow_dispatch 的 inputs 绝不能插值进 run 脚本：days 是自由文本，
+      # 直接拼接等于把 contents: write 的权限暴露给任何能触发 dispatch 的人。
+      - name: Workflow 输入注入检查
+        run: |
+          python - <<'PY'
+          import glob
+          import yaml
+
+          bad = []
+          needle = chr(36) + "{{ inputs."
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              with open(path, encoding='utf-8') as fh:
+                  doc = yaml.safe_load(fh)
+              for job in (doc.get('jobs') or {}).values():
+                  for step in job.get('steps', []):
+                      if needle in (step.get('run') or ''):
+                          bad.append(f"{path}: {step.get('name', '(未命名步骤)')}")
+          if bad:
+              for item in bad:
+                  print(f"::error::{item} 把 inputs 直接插入了 run 脚本")
+              raise SystemExit(1)
+          print('未发现 workflow inputs 源码插值')
+          PY
+
+      - name: 告警通道统一入口检查
+        run: |
+          for f in .github/workflows/*.yml; do
+            if [ "$f" = ".github/workflows/ci.yml" ]; then continue; fi
+            if grep -q 'if: failure()' "$f" && ! grep -q 'feishu.send' "$f"; then
+              echo "::error::$f 有失败告警但未走带签名的发送层"
+              exit 1
+            fi
+          done
+          echo "失败告警均走带签名的发送层"

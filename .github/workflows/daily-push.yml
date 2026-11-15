@@ -88,15 +88,29 @@ jobs:
           # 失败告警统一由下面的 workflow 步骤发送，关掉脚本内那条，避免群里收到两条
           ALERT_ON_FAIL: "0"
           TZ: Asia/Shanghai
+          # workflow_dispatch 的 inputs 一律经 env 传入，绝不插值进 run 脚本。
+          # 尤其 days 是自由文本：旧写法 `"${{ inputs.days }}"` 允许通过 API
+          # 传入 `10; <任意命令>`，等于把仓库的 contents: write 权限暴露出去。
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_REFRESH: ${{ inputs.refresh }}
+          INPUT_DAYS: ${{ inputs.days }}
+          INPUT_FORCE: ${{ inputs.force }}
         run: |
-          MODE="${{ inputs.mode }}"
+          MODE="${INPUT_MODE:-normal}"
           REFRESH=""
-          if [ "${{ inputs.refresh }}" = "true" ]; then REFRESH="--refresh"; fi
+          if [ "$INPUT_REFRESH" = "true" ]; then REFRESH="--refresh"; fi
           case "$MODE" in
             demo)     python push.py --demo ;;
             preview)  python push.py --dry-run ;;
-            backfill) python backfill.py --days "${{ inputs.days }}" $REFRESH ;;
-            *)        if [ "${{ inputs.force }}" = "true" ]; then python push.py --force; else python push.py; fi ;;
+            backfill)
+              # 白名单：只允许 1~365 的纯数字，挡掉命令注入与异常大的回补
+              if ! printf '%s' "$INPUT_DAYS" | grep -Eq '^[0-9]{1,3}$' || \
+                 [ "$INPUT_DAYS" -lt 1 ] || [ "$INPUT_DAYS" -gt 365 ]; then
+                echo "::error::非法 days 输入（须为 1~365 的整数）：$INPUT_DAYS"
+                exit 1
+              fi
+              python backfill.py --days "$INPUT_DAYS" $REFRESH ;;
+            *)        if [ "$INPUT_FORCE" = "true" ]; then python push.py --force; else python push.py; fi ;;
           esac
 
       - name: Upload snapshot (debug)
@@ -113,6 +127,8 @@ jobs:
       # 会掩盖真正的失败原因。preview/demo 不写库，也不该走提交。
       - name: Commit history
         if: success() && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || inputs.mode == '' || inputs.mode == 'normal' || inputs.mode == 'backfill')
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -120,7 +136,7 @@ jobs:
           # 回补模式：把断点缓存也强制提交回去（.gitignore 里默认忽略它）。
           # 注意缓存会随每次回补增大仓库体积；缓存本身按「最新行情日」自动失效，
           # 不会再出现写满一次就永远不刷新的问题（见 sources.fetch_history）。
-          if [ "${{ inputs.mode }}" = "backfill" ]; then
+          if [ "${INPUT_MODE:-normal}" = "backfill" ]; then
             git add -f data/.hist_cache.json 2>/dev/null || true
           fi
           if git diff --cached --quiet; then
