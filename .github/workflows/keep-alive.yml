@@ -67,7 +67,7 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python - <<'PY' || echo "::error::心跳告警发送失败"
+          python - <<'PY' || { echo "::error::心跳告警发送失败"; exit 1; }
           import os
           from etfpush import feishu
           independent = os.environ.get("ALERT_WEBHOOK", "").strip()

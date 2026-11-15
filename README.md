@@ -47,6 +47,18 @@
 | `ALERT_WEBHOOK` | 建议 | 独立告警机器人 Webhook；业务 webhook 挂掉时告警仍能发出 |
 | `ALERT_SECRET` | 可选 | 独立告警机器人的签名密钥 |
 
+> **加签要么两个机器人都开，要么都不开。** 只开一半不是「部分失效」而是全链路静默：
+> 业务推送被拒（`19021`，HTTP 仍 200）→ 触发 `if: failure()` 告警 → 告警机器人同样要求
+> 签名 → 告警也发不出去。运行页只剩一条 error，群里一条消息都没有。
+>
+> 现在推送失败会把 `19021` 翻译成「机器人开启了加签，请配置 FEISHU_SECRET」，
+> 告警发送失败也会让该步骤判红，不再只是打一行日志。
+
+```bash
+gh secret set FEISHU_SECRET --body '<业务机器人签名密钥>' --repo Wind866/etf-feishu-push
+gh secret set ALERT_SECRET  --body '<告警机器人签名密钥>' --repo Wind866/etf-feishu-push
+```
+
 配好之后进 **Actions** → `ETF 资金流向 · 每交易日 20:00 推送飞书` → **Run workflow** 手动跑一次验证。
 
 ### 关于图片消息（可选，但强烈建议）

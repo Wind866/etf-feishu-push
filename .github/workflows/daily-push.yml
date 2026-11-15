@@ -167,7 +167,7 @@ jobs:
           # 原版直接用 curl 发裸 text，机器人开了签名校验时会返回 19021，
           # 「退回业务 webhook」这条兜底其实永远发不出去。这里复用带签名的
           # feishu.send()，并允许独立告警机器人配自己的 ALERT_SECRET。
-          python - <<'PY' || echo "::error::失败告警发送失败（请检查告警 webhook 与签名密钥）"
+          python - <<'PY' || { echo "::error::失败告警发送失败（请检查告警 webhook 与签名密钥）"; exit 1; }
           import os
           from etfpush import feishu
 

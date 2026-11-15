@@ -60,7 +60,11 @@ def send(payload: dict) -> bool:
         raise RuntimeError(f"飞书返回非 JSON（HTTP {resp.status_code}）：{resp.text[:200]}") from exc
     code = data.get("code", data.get("StatusCode"))
     if code not in (0, "0", None):
-        raise RuntimeError(f"飞书推送失败：{data}")
+        # 19021 只会在「机器人开了加签但仓库没配密钥」时出现，HTTP 仍是 200，
+        # 单看返回体看不出该去配 FEISHU_SECRET，这里直接把结论写进异常。
+        hint = "（19021 = 机器人开启了加签，请配置 FEISHU_SECRET）" \
+            if code in (19021, "19021") else ""
+        raise RuntimeError(f"飞书推送失败：{data}{hint}")
     print(f"✅ 飞书推送成功（{payload.get('msg_type')}）")
     return True
 
