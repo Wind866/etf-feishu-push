@@ -1,0 +1,86 @@
+name: Keep Alive
+
+# GitHub 只在仓库连续 60 天无任何活动时才禁用定时任务。
+# 数据源连续失败时 history.json 不变 → 无 bot 提交 → 仓库进入静默，
+# 60 天后 schedule 被禁用、数据源恢复也不会自己跑起来。这里每周留一次
+# 心跳提交，保证 etf-feishu-push 不掉进「漏跑 → 无提交 → 被禁用」的闭环。
+on:
+  schedule:
+    - cron: '0 17 * * 1'   # UTC 周一 17:00 = 北京周二 01:00（与另两仓库错峰的档期同分钟即可）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: etf-keep-alive
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: 记录心跳并裁剪日志
+        run: |
+          echo "Keep alive at $(date '+%Y-%m-%d %H:%M:%S %Z')" >> .github/keep-alive.log
+          tail -n 60 .github/keep-alive.log > .github/keep-alive.log.tmp
+          mv .github/keep-alive.log.tmp .github/keep-alive.log
+
+      - name: 提交变更
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # -f：即使 .gitignore 把 *.log 忽略了也能提交，心跳不能因一条规则失效
+          git add -f .github/keep-alive.log
+          if git diff --staged --quiet; then
+            echo "无变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: keep alive $(date '+%Y-%m-%d')"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          for i in 1 2 3; do
+            if git push origin "HEAD:$BRANCH"; then
+              echo "已推送（第 $i 次尝试）"
+              exit 0
+            fi
+            echo "::warning::推送失败（第 $i 次），rebase 后重试"
+            git pull --rebase --autostash origin "$BRANCH" || { git rebase --abort 2>/dev/null || true; }
+            sleep $((i * 2))
+          done
+          echo "::error::连续 3 次推送失败，本周心跳未入库"
+          exit 1
+
+      # 心跳失败自己不会有人看 Actions 页；超时/取消时 failure() 同样不触发。
+      - name: 心跳失败 / 取消告警
+        if: failure() || (always() && job.status == 'cancelled')
+        env:
+          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+          ALERT_SECRET: ${{ secrets.ALERT_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY' || echo "::error::心跳告警发送失败"
+          import os
+          from etfpush import feishu
+          independent = os.environ.get("ALERT_WEBHOOK", "").strip()
+          hook = independent or os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("::error::未配置告警 webhook，跳过心跳告警")
+              raise SystemExit(0)
+          os.environ["FEISHU_WEBHOOK"] = hook
+          os.environ["FEISHU_SECRET"] = (
+              os.environ.get("ALERT_SECRET", "") if independent
+              else os.environ.get("FEISHU_SECRET", "")
+          )
+          status = "失败" if os.environ.get("GITHUB_JOB") else "失败/取消"
+          feishu.send({"msg_type": "text",
+                       "content": {"text": f"⚠️ ETF Keep Alive 心跳未入库（{status}），定时任务有被停用风险：{os.environ.get('RUN_URL','')}"}})
+          PY
