@@ -226,7 +226,14 @@ python push.py
 │   ├── etf_codes.txt           # 离线兜底代码清单（自动回写）
 │   └── demo_history.json       # 演示数据（只读）
 ├── docs/preview.png            # 预览图
-└── .github/workflows/daily-push.yml
+├── backfill.py                 # 历史回补（也可由 daily-push 的 backfill 模式调用）
+├── requirements.txt            # 核心依赖
+├── requirements-optional.txt   # 可选兜底数据源
+├── tests/                      # 回归 / 冒烟测试（CI 依赖）
+└── .github/workflows/
+    ├── daily-push.yml          # 交易日推送主流程
+    ├── ci.yml                  # 代码门禁：语法 / 单测 / 依赖检查
+    └── keep-alive.yml          # 每周心跳提交，防 60 天无活动被禁定时任务
 ```
 
 ## 改时间 / 改列
