@@ -6,7 +6,7 @@ name: Keep Alive
 # 心跳提交，保证 etf-feishu-push 不掉进「漏跑 → 无提交 → 被禁用」的闭环。
 on:
   schedule:
-    - cron: '0 17 * * 1'   # UTC 周一 17:00 = 北京周二 01:00（与另两仓库错峰的档期同分钟即可）
+    - cron: '3 17 * * 1'   # UTC 周一 17:03 = 北京周二 01:03（与另两仓库错峰的档期同分钟即可）
   workflow_dispatch:
 
 permissions:

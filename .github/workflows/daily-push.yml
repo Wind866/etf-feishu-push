@@ -1,15 +1,15 @@
-name: ETF 资金流向 · 每交易日 20:00 推送飞书
+name: ETF 资金流向 · 每交易日 20:03 推送飞书
 
 on:
   schedule:
-    # GitHub cron 走 UTC：12/13/14 UTC = 北京时间 20/21/22 点，周一至周五。
+    # GitHub cron 走 UTC：12/13/14 UTC = 北京时间 20:03 / 21:03 / 22:03，周一至周五。
     # 单档 cron 在同账号实测延迟 3~10 小时、甚至整档丢弃，这里铺三档兜底；
     # 脚本用「行情日期 + 3 小时推送窗口」做幂等判重，不会重复刷屏。
     # 数据日期取行情时间戳而非运行时刻，即使延迟跨过午夜也不会错行或丢当天数据。
     # 准点仍可由外部 Cloudflare Worker 通过 repository_dispatch / workflow_dispatch 触发。
-    - cron: '0 12 * * 1-5'
-    - cron: '0 13 * * 1-5'
-    - cron: '0 14 * * 1-5'
+    - cron: '3 12 * * 1-5'
+    - cron: '3 13 * * 1-5'
+    - cron: '3 14 * * 1-5'
   repository_dispatch:
     types: [etf-push]
   workflow_dispatch:

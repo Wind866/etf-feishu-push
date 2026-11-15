@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-每个 **A 股交易日 20:00（北京时间）** 自动统计全市场 ETF 的**主力资金净流入**，按 8 个宽基指数汇总成一张表，以**图片消息**推到飞书群。
+每个 **A 股交易日 20:03（北京时间）** 自动统计全市场 ETF 的**主力资金净流入**，按 8 个宽基指数汇总成一张表，以**图片消息**推到飞书群。
 
 > 用 GitHub Actions 跑，不需要服务器、不需要数据库，历史数据直接存仓库里的 `data/history.json`。
 
@@ -14,7 +14,7 @@
 ## 它是怎么工作的
 
 ```
-每交易日 20:00（UTC 12:00，另有 21/22 点两档兜底）
+每交易日 20:03（UTC 12:03，另有 21:03 / 22:03 两档兜底）
         │
         ├─ 交易日判定   取上证指数最新行情时间戳，并把它作为「数据日期」记账
         ├─ 抓取数据     天天基金代码表 → 东财 ulist 批量取 f62（主力净流入）
@@ -59,7 +59,7 @@ gh secret set FEISHU_SECRET --body '<业务机器人签名密钥>' --repo Wind86
 gh secret set ALERT_SECRET  --body '<告警机器人签名密钥>' --repo Wind866/etf-feishu-push
 ```
 
-配好之后进 **Actions** → `ETF 资金流向 · 每交易日 20:00 推送飞书` → **Run workflow** 手动跑一次验证。
+配好之后进 **Actions** → `ETF 资金流向 · 每交易日 20:03 推送飞书` → **Run workflow** 手动跑一次验证。
 
 ### 关于图片消息（可选，但强烈建议）
 
@@ -250,7 +250,7 @@ python push.py
 
 ## 改时间 / 改列
 
-- **改推送时间**：编辑 `.github/workflows/daily-push.yml` 里的三条 `cron`。cron 用 **UTC**，北京时间减 8 小时，20:00 → `0 12`；三档分别是 20/21/22 点，靠脚本判重保证只推一次。
+- **改推送时间**：编辑 `.github/workflows/daily-push.yml` 里的三条 `cron`。cron 用 **UTC**，北京时间减 8 小时，20:03 → `3 12`；三档分别是 20:03 / 21:03 / 22:03，靠脚本判重保证只推一次。
 - **改展示列**：`etfpush/config.py` 的 `COLUMNS` + `INDEX_PATTERNS`。两处要同步，列名即图片表头。
 
 ## 常见问题
