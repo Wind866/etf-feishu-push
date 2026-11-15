@@ -31,7 +31,8 @@ updates:
       prefix: "chore(deps)"
     # 这三条是「人工决策项」，机器人每周开一次 PR、每周被关一次，纯噪音：
     #   * Pillow 13 跨大版本。出图是本仓库唯一产出，字体度量/颜色管理一变，
-    #     图片就是「能出但难看」，测试断言看不出来，必须人工出图对比。
+    #     图片就是「能出但难看」，测试断言看不出来，必须人工出图对比；
+    #     下界抬升（10.0.0 → 10.4.0）同 requests，pip 本来就装 <12 里最新版。
     #   * akshare 钉死 ==1.20.42：fund_etf_spot_em() 的列名是硬约定，
     #     升级要同步改 BIGApush 并重跑兜底通道验证，不能由机器人决定。
     #   * requests 的下界只是「已知可用最低版本」，pip 实际装的是 <3 里最新版，
@@ -40,7 +41,10 @@ updates:
     # 安全更新（security updates）不受影响，有漏洞照样会开 PR。
     ignore:
       - dependency-name: "pillow"
-        update-types: ["version-update:semver-major"]
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
       - dependency-name: "akshare"
         update-types:
           - "version-update:semver-major"
