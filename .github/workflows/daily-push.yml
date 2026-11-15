@@ -2,12 +2,16 @@ name: ETF 资金流向 · 每交易日 20:00 推送飞书
 
 on:
   schedule:
-    # GitHub 的 cron 走 UTC：12:00 UTC = 北京时间 20:00，周一至周五。
-    # 准点由 Cloudflare Worker（见 BIGApush/cloudflare/README.md）workflow_dispatch；
-    # GitHub cron 只作兜底 —— 同账号实测延迟 3~10 小时甚至丢弃档期。
-    # 脚本自带 history.json 交易日判重，两个触发器不会重复推送。
-    # 遇到 A 股节假日由脚本内的交易日探测自动跳过。
+    # GitHub cron 走 UTC：12/13/14 UTC = 北京时间 20/21/22 点，周一至周五。
+    # 单档 cron 在同账号实测延迟 3~10 小时、甚至整档丢弃，这里铺三档兜底；
+    # 脚本用「行情日期 + 3 小时推送窗口」做幂等判重，不会重复刷屏。
+    # 数据日期取行情时间戳而非运行时刻，即使延迟跨过午夜也不会错行或丢当天数据。
+    # 准点仍可由外部 Cloudflare Worker 通过 repository_dispatch / workflow_dispatch 触发。
     - cron: '0 12 * * 1-5'
+    - cron: '0 13 * * 1-5'
+    - cron: '0 14 * * 1-5'
+  repository_dispatch:
+    types: [etf-push]
   workflow_dispatch:
     inputs:
       mode:
@@ -19,6 +23,10 @@ on:
         description: '仅 backfill 用：回补最近几个交易日'
         type: string
         default: '10'
+      refresh:
+        description: '仅 backfill 用：忽略断点缓存全量重取'
+        type: boolean
+        default: false
       force:
         description: '交易日已推过相同数据也强制重推'
         type: boolean
@@ -77,13 +85,17 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          # 失败告警统一由下面的 workflow 步骤发送，关掉脚本内那条，避免群里收到两条
+          ALERT_ON_FAIL: "0"
           TZ: Asia/Shanghai
         run: |
           MODE="${{ inputs.mode }}"
+          REFRESH=""
+          if [ "${{ inputs.refresh }}" = "true" ]; then REFRESH="--refresh"; fi
           case "$MODE" in
             demo)     python push.py --demo ;;
             preview)  python push.py --dry-run ;;
-            backfill) python backfill.py --days "${{ inputs.days }}" ;;
+            backfill) python backfill.py --days "${{ inputs.days }}" $REFRESH ;;
             *)        if [ "${{ inputs.force }}" = "true" ]; then python push.py --force; else python push.py; fi ;;
           esac
 
@@ -100,15 +112,14 @@ jobs:
       # 旧版 if: always() 会把失败/取消时的不完整数据也提交，且 git push 的二次报错
       # 会掩盖真正的失败原因。preview/demo 不写库，也不该走提交。
       - name: Commit history
-        if: success() && (github.event_name == 'schedule' || inputs.mode == '' || inputs.mode == 'normal' || inputs.mode == 'backfill')
+        if: success() && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || inputs.mode == '' || inputs.mode == 'normal' || inputs.mode == 'backfill')
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/history.json data/etf_codes.txt
           # 回补模式：把断点缓存也强制提交回去（.gitignore 里默认忽略它）。
-          # 这是「回补一直成功不了」的根因修复——push2his 频控严，单次跑不完 1800 只，
-          # 缓存不落库下次就冷启动重头再来，永远凑不满 1200 只的闸门。
-          # 强制入库后，每次手动 backfill 都能从上次进度续传，直到全部补齐。
+          # 注意缓存会随每次回补增大仓库体积；缓存本身按「最新行情日」自动失效，
+          # 不会再出现写满一次就永远不刷新的问题（见 sources.fetch_history）。
           if [ "${{ inputs.mode }}" = "backfill" ]; then
             git add -f data/.hist_cache.json 2>/dev/null || true
           fi
@@ -124,14 +135,32 @@ jobs:
         if: failure()
         env:
           ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+          ALERT_SECRET: ${{ secrets.ALERT_SECRET }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "$ALERT_WEBHOOK" ]; then
-            echo "::error::未配置独立告警 Secret ALERT_WEBHOOK；本次告警退回业务 webhook，业务 webhook 故障时告警会一并失效"
-          fi
-          HOOK="${ALERT_WEBHOOK:-$FEISHU_WEBHOOK}"
-          if [ -z "$HOOK" ]; then echo "::error::未配置告警 webhook，跳过失败告警"; exit 0; fi
-          curl -sS -X POST "$HOOK" -H "Content-Type: application/json" \
-            -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"⚠️ ETF 资金流向任务运行失败，请查看日志：$RUN_URL\"}}" \
-            >/dev/null || echo "::error::告警发送失败（独立告警通道可能也失效）"
+          # 原版直接用 curl 发裸 text，机器人开了签名校验时会返回 19021，
+          # 「退回业务 webhook」这条兜底其实永远发不出去。这里复用带签名的
+          # feishu.send()，并允许独立告警机器人配自己的 ALERT_SECRET。
+          python - <<'PY' || echo "::error::失败告警发送失败（请检查告警 webhook 与签名密钥）"
+          import os
+          from etfpush import feishu
+
+          independent = os.environ.get("ALERT_WEBHOOK", "").strip()
+          hook = independent or os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("::error::未配置告警 webhook，跳过失败告警")
+              raise SystemExit(0)
+          os.environ["FEISHU_WEBHOOK"] = hook
+          os.environ["FEISHU_SECRET"] = (
+              os.environ.get("ALERT_SECRET", "") if independent
+              else os.environ.get("FEISHU_SECRET", "")
+          )
+          url = os.environ.get("RUN_URL", "")
+          try:
+              feishu.send({"msg_type": "text",
+                           "content": {"text": f"⚠️ ETF 资金流向任务运行失败，请查看日志：{url}"}})
+          except Exception as exc:
+              print(f"::error::告警发送失败：{exc}")
+          PY

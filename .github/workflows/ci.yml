@@ -29,6 +29,11 @@ jobs:
       - name: 安装校验依赖
         run: python -m pip install -q "PyYAML>=6.0,<7"
 
+      # 回归测试会 import etfpush（sources 顶层依赖 requests），
+      # 所以这里也要装运行时依赖，否则 CI 会在收集测试时就 ImportError。
+      - name: 安装运行时依赖
+        run: python -m pip install -q -r requirements.txt
+
       - name: 语法编译检查
         run: python -m compileall -q .
 
