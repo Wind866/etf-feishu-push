@@ -90,18 +90,27 @@ MIN_PER_INDEX = 3         # 没有基准时的保底：每个宽基至少要几�
 MIN_INDEX_RATIO = 0.6     # 有基准时：每个指数至少抓到代码表里 60% 的只数
 
 
-def sanity_check(info: dict, expected: dict | None = None) -> None:
-    """expected: {指数: 代码表里该指数的 ETF 只数}，用来做相对判定。
+def sanity_check(info: dict, expected: dict | None = None,
+                 expected_total: int | None = None) -> None:
+    """expected: {指数: 代码表里该指数的 ETF 只数}；expected_total: 有效候选总数。
 
-    为什么不用绝对只数：全市场上证50 只有 11 只 ETF，抓到 2 只可能是漏了一批，
+    绝对只数不能当标准：全市场上证50 只有 11 只 ETF，抓到 2 只可能是漏了一批，
     但只要抓到 0 只就一定是规则或代码表坏了 —— 用比例判才不会误杀。
+    总量同理：固定 1200 的下限在代码表涨到 2100+ 只后形同虚设，
+    缺 900 只也能通过，必须再按「占有效候选数的比例」卡一道。
     """
     counts = info.get("counts", {})
     total = counts.get("所有ETF", 0)
-    if total < MIN_ETFS_TOTAL:
+    need_total = MIN_ETFS_TOTAL
+    if expected_total:
+        need_total = max(MIN_ETFS_TOTAL,
+                         int(round(expected_total * config.MIN_TOTAL_RATIO)))
+    if total < need_total:
         raise RuntimeError(
-            f"抓到的 ETF 只有 {total} 只，少于下限 {MIN_ETFS_TOTAL}，"
-            "判定为数据不完整，本次不推送"
+            f"抓到的 ETF 只有 {total} 只，少于下限 {need_total}"
+            + (f"（有效候选 {expected_total} 只 × {config.MIN_TOTAL_RATIO:.0%}）"
+               if expected_total else "")
+            + "，判定为数据不完整，本次不推送"
         )
     bad = {}
     for col in config.COLUMNS[1:]:
@@ -118,8 +127,9 @@ def sanity_check(info: dict, expected: dict | None = None) -> None:
         )
 
 
-def evaluate(items: list[tuple[str, float]], expected: dict | None = None) -> tuple[dict, dict]:
+def evaluate(items: list[tuple[str, float]], expected: dict | None = None,
+             expected_total: int | None = None) -> tuple[dict, dict]:
     """聚合 + 完整性校验，返回 (stats, info)；不合格直接抛异常。"""
     stats, info = aggregate(items)
-    sanity_check(info, expected)
+    sanity_check(info, expected, expected_total)
     return stats, info

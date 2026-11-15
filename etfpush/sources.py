@@ -181,6 +181,27 @@ def _is_etf_code(code: str) -> bool:
     return code.startswith("159") or code[:2] in SH_PREFIXES
 
 
+def _looks_like_etf(name: str) -> bool:
+    """把「混在 ETF 代码段里的场外基金」挡在代码表之外。
+
+    天天基金 fundcode_search.js 是**全量基金表**，501/502/505/506/508 等代码段
+    还包含 LOF、定开混合、三年持有、场外 QDII（如「东方红睿玺三年持有混合A」
+    「南方原油A」）。原实现只按代码段筛，2287 条里有 423 条是这类非 ETF：
+      * 有行情的 LOF 会被算进「所有ETF」，合计被污染；
+      * 没行情的会稀释覆盖率分母，让 0.6 的通道闸门变得毫无意义，
+        补抓阶段还要为它们白跑两轮。
+    场内 ETF 的简称/全称一律带 ETF 字样，用名称再卡一道最稳。
+    """
+    upper = str(name).upper()
+    if "ETF" not in upper:
+        return False
+    if any(k in upper for k in config.NON_ETF_KEYWORDS):
+        return False
+    if any(k in str(name) for k in config.CASH_KEYWORDS):
+        return False
+    return True
+
+
 def _secid(code: str) -> str:
     """代码 → 东财 secid：1.=沪市 / 0.=深市。"""
     return ("0." if code.startswith("159") else "1.") + code
@@ -202,12 +223,18 @@ def universe_from_fundlist() -> list[dict]:
         raise RuntimeError("基金代码表格式变化，未匹配到数组")
     rows = json.loads(match.group(0))
     out = []
+    dropped = 0
     for item in rows:
         code, name = str(item[0]), str(item[2]).strip()
-        if _is_etf_code(code) and name:
-            out.append({"secid": _secid(code), "code": code, "name": name})
+        if not (_is_etf_code(code) and name):
+            continue
+        if not _looks_like_etf(name):
+            dropped += 1          # LOF / 定开混合 / 场外 QDII / 联接 / 货币类
+            continue
+        out.append({"secid": _secid(code), "code": code, "name": name})
     if not out:
         raise RuntimeError("基金代码表中未筛出 ETF")
+    print(f"  基金代码表：按名称剔除 {dropped} 只非 ETF 品种，保留 {len(out)} 只")
     return out
 
 
@@ -290,8 +317,12 @@ def universe_from_local() -> list[dict]:
             parts = line.split()
             if len(parts) < 2 or not _is_etf_code(parts[0]):
                 continue
-            out.append({"secid": _secid(parts[0]), "code": parts[0],
-                        "name": "".join(parts[1:])})
+            name = "".join(parts[1:])
+            # 旧版回写的清单里混有场外基金，降级读回来时同样要过滤，
+            # 否则在线源全挂时口径会和平时不一致。
+            if not _looks_like_etf(name):
+                continue
+            out.append({"secid": _secid(parts[0]), "code": parts[0], "name": name})
     if not out:
         raise RuntimeError("data/etf_codes.txt 内容为空")
     return out
@@ -352,10 +383,37 @@ def expected_counts() -> dict[str, int] | None:
         return None
     out: dict[str, int] = {}
     for item in universe:
+        if not _looks_like_etf(item["name"]):
+            continue
         col = classify(item["name"])
         if col:
             out[col] = out.get(col, 0) + 1
     return out or None
+
+
+def universe_stats() -> dict:
+    """一次性给出闸门所需的两个基准：各指数只数 + 有效候选总数。
+
+    有效候选 = 代码表里真正会进入「所有ETF」统计的品种数。用它做分母，
+    闸门才能随 ETF 数量增长自动收紧，而不是永远卡在 1200 这个绝对值上。
+    """
+    from .aggregate import classify      # 延迟导入：aggregate 只依赖 config
+
+    try:
+        universe = get_universe()
+    except Exception:  # noqa: BLE001
+        return {}
+    indices: dict[str, int] = {}
+    total = 0
+    for item in universe:
+        if not _looks_like_etf(item["name"]):
+            continue
+        total += 1
+        col = classify(item["name"])
+        if col:
+            indices[col] = indices.get(col, 0) + 1
+    print(f"  闸门基准：有效候选 {total} 只 ETF，各宽基 {indices}")
+    return {"indices": indices or None, "total": total or None}
 
 
 # ---------------------------------------------------------------
@@ -482,11 +540,19 @@ def fetch_eastmoney() -> list[tuple[str, float]]:
     _fill_missing(codes, flow, deadline)
 
     items = [(name_by_code[c], v) for c, v in flow.items() if c in name_by_code]
-    cover = len(items) / max(len(codes), 1)
-    print(f"  东财批量：{len(items)}/{len(codes)} 个代码有资金流（覆盖 {cover:.0%}，"
+    # 分母只用「有效候选」：已清盘 / 停牌 / 代码表里的场外基金本来就没有 f62，
+    # 把它们算进分母会低估真实覆盖率；反过来，用固定 0.6 又会放过整批丢失。
+    candidates = [c for c in codes if _looks_like_etf(name_by_code[c])]
+    got = sum(1 for c in candidates if c in flow)
+    cover = got / max(len(candidates), 1)
+    print(f"  东财批量：{len(items)}/{len(codes)} 个代码有资金流"
+          f"（有效候选覆盖 {got}/{len(candidates)} = {cover:.0%}，"
           f"耗时 {time.time() - t0:.0f}s）")
-    if cover < 0.6:
-        raise RuntimeError(f"覆盖度过低（{cover:.0%}），判定本通道数据不可信")
+    if cover < config.MIN_CHANNEL_COVER:
+        raise RuntimeError(
+            f"有效候选覆盖度过低（{cover:.0%} < {config.MIN_CHANNEL_COVER:.0%}），"
+            "判定本通道数据不可信"
+        )
     return items
 
 
@@ -631,7 +697,8 @@ def _save_hist_cache(path, cache: dict) -> None:
 
 def fetch_history(days: int = 20, workers: int = 3, pace: float = 0.4,
                   cache_path=None, max_passes: int = 5,
-                  refresh: bool = False) -> dict[str, list[tuple[str, float]]]:
+                  refresh: bool = False,
+                  stale_date: date | None = None) -> dict[str, list[tuple[str, float]]]:
     """回补用：{交易日: [(ETF 名称, 主力净流入元)]}。
 
     为什么这么小心：日线接口（push2his）的频控比实时接口严得多。
@@ -649,7 +716,18 @@ def fetch_history(days: int = 20, workers: int = 3, pace: float = 0.4,
     if cache:
         print(f"  断点续传：已有 {len(cache)} 只的历史缓存")
 
-    pending = [u for u in universe if u["code"] not in cache]
+    # 缓存原来是「一次抓取、永久复用」：pending 只看 code 在不在 cache 里，
+    # 于是第一次跑完之后所有代码都被认为已完成，日线接口再也不会被调用，
+    # 新交易日的数据永远补不进来（workflow 还把这份旧缓存强制提交回仓库，
+    # 等于把过期状态持久化了）。这里按「缓存里最新的日期」判断是否过期。
+    expired = False
+    if cache and stale_date and not refresh:
+        newest = max((max(series) for series in cache.values() if series), default="")
+        if newest and newest < stale_date.isoformat():
+            expired = True
+            print(f"  ⚠️ 断点缓存最新日期 {newest} 早于最新行情日 {stale_date}，"
+                  "判定过期，本轮全量重取（旧值保留作失败时的回退）")
+    pending = [u for u in universe if expired or u["code"] not in cache]
     total = len(universe)
 
     def one(item: dict):
@@ -767,29 +845,62 @@ def _probe_eastmoney() -> date | None:
     return datetime.fromtimestamp(int(diff[0]["f124"]), config.CN_TZ).date()
 
 
-def latest_trade_date() -> date | None:
-    """返回「最新一个已有行情的交易日」；两个探测源都失败时返回 None。"""
+def _plausible_quote_date(d, today: date) -> bool:
+    """挡住 f124 毫秒/0、腾讯串里抓错 14 位数字等异常时间戳。
+
+    原版把任何解析出来的日期都当真：一个 1970 或 5 年后的日期会被判成
+    「今天休市」直接跳过；反过来若探测失败又会「按工作日继续」，
+    拿上一交易日的 f62 快照记成今天。两种都是错行。
+    """
+    if not isinstance(d, date):
+        return False
+    return -1 <= (today - d).days <= config.SESSION_MAX_STALE_DAYS
+
+
+def latest_trade_date(today: date | None = None) -> date | None:
+    """返回「最新一个已有行情的交易日」；两个探测源都失败/异常时返回 None。"""
+    today = today or datetime.now(config.CN_TZ).date()
     for name, probe in (("腾讯", _probe_tencent), ("东财", _probe_eastmoney)):
         try:
             d = probe()
-            if d:
+            if _plausible_quote_date(d, today):
                 return d
-            print(f"  ⚠️ 交易日探测（{name}）返回空")
+            print(f"  ⚠️ 交易日探测（{name}）返回空或日期异常：{d}")
         except Exception as exc:  # noqa: BLE001
             print(f"  ⚠️ 交易日探测（{name}）失败：{exc}")
     return None
 
 
-def is_trading_day(today: date) -> tuple[bool, str]:
-    """(是否交易日, 原因说明)。判定不依赖节假日表，只看行情时间戳。"""
-    if today.weekday() >= 5:
-        return False, "今天是周末，A 股休市"
-    lt = latest_trade_date()
+def trading_session(today: date) -> tuple[bool, date, str]:
+    """(是否继续, 数据日期, 原因)。
+
+    核心修正：**数据日期必须取行情时间戳里的日期，而不是运行时刻的本地日期**。
+    GitHub cron 实测会延迟 3~10 小时，一旦跨过午夜，原版 today 变成次日，
+    交易日探测又会因「最新行情还停在昨天」判成休市直接跳过 —— 当天数据永久丢失；
+    探测双失败时更会把昨天的快照记成今天。用行情日期记账 + 按日期判重，
+    延迟、节假日、周末、多档 cron 就全部自洽了。
+    """
+    lt = latest_trade_date(today)
     if lt is None:
-        return True, "行情时间戳取不到，按工作日继续（数据本身有去重保护）"
-    if lt == today:
-        return True, f"最新行情日期 {lt}，正常交易日"
-    return False, f"最新行情还停在 {lt}，今天休市（节假日），跳过推送"
+        return False, today, (
+            "两个行情时间戳都取不到或日期异常；为避免把上一交易日的快照错记到今天，"
+            "本次跳过（确认后可用 --force 强制）"
+        )
+    if lt > today:
+        return False, today, f"行情日期 {lt} 晚于运行日 {today}，时间戳异常，跳过"
+    stale = (today - lt).days
+    if stale > config.SESSION_MAX_STALE_DAYS:
+        return False, today, f"最新行情停在 {lt}（距今 {stale} 天），数据疑似过期，跳过"
+    if stale:
+        return True, lt, (f"运行日 {today}，最新行情日 {lt}（相差 {stale} 天，"
+                          "按行情日期记账；该日若已推送会自动跳过）")
+    return True, lt, f"最新行情日期 {lt}，正常交易日"
+
+
+def is_trading_day(today: date) -> tuple[bool, str]:
+    """兼容旧调用：只返回 (是否继续, 原因)，数据日期请用 trading_session。"""
+    ok, _data_date, reason = trading_session(today)
+    return ok, reason
 
 
 # ---------------------------------------------------------------

@@ -21,11 +21,10 @@ import sys
 
 from etfpush import aggregate, config, history, sources
 
-# 回补用的「宽松闸门下限」：历史补全优先于当日严格闸门（1200）。
-# 只要某天拿到 >=900 只 ETF 的主力净流入，就先记进去（仅供参考），
-# 避免「差几只就整天空跑、永远写不进 history.json」的死循环。
-# 当日严格推送（push.py）仍走 aggregate.MIN_ETFS_TOTAL=1200，不受影响。
-BACKFILL_MIN_ETFS = 900
+# 回补与当日推送必须同口径：原版放宽到 900 只就写入，而线上闸门是 1200 只，
+# 于是同一张「近 10 个交易日」表里会掺入只统计了半个市场的行，
+# 「所有ETF」列在拼接处凭空跳变，看起来像行情突变，其实是数据缺失。
+BACKFILL_MIN_ETFS = 1200
 
 
 def _parse_args(argv=None):
@@ -48,8 +47,11 @@ def main(argv=None) -> int:
     print(f"=== 历史回补 · 目标最近 {args.days} 个交易日 ===")
 
     # 多取一些日子再截断：长假 / 停牌会让实际交易日比日历天数少
+    # stale_date 让断点缓存在「出现新交易日」后自动失效并全量重取，
+    # 否则缓存一旦写满就再也不会请求日线接口（详见 sources.fetch_history）。
     flows = sources.fetch_history(days=max(args.days * 2, 24), workers=args.workers,
-                                  pace=args.pace, refresh=args.refresh)
+                                  pace=args.pace, refresh=args.refresh,
+                                  stale_date=sources.latest_trade_date())
     dates = sorted(flows)[-args.days:]
 
     hist = history.load()
@@ -63,13 +65,10 @@ def main(argv=None) -> int:
         stats, info = aggregate.aggregate(rows)
         total = info["counts"]["所有ETF"]
         if total < BACKFILL_MIN_ETFS:
-            print(f"⚠️ {d} 仅 {total} 只 ETF（<{BACKFILL_MIN_ETFS}），数据不完整，"
-                  f"暂跳过；继续回补后再次运行本脚本即可补上")
+            print(f"⚠️ {d} 仅 {total} 只 ETF（<{BACKFILL_MIN_ETFS}），与线上口径不一致，"
+                  f"暂不写入；缓存已保留，再次运行本脚本即可从断点续传补齐")
             incomplete += 1
             continue
-        if total < aggregate.MIN_ETFS_TOTAL:
-            print(f"⚠️ {d} 仅 {total} 只 ETF（低于当日严格值 {aggregate.MIN_ETFS_TOTAL}），"
-                  f"仍写入（历史补全，仅供参考）")
         hist = history.upsert(hist, d, stats)
         print(f"✅ {d} 写入：{total} 只 ETF，所有ETF {stats['所有ETF']:+.2f} 亿")
         written += 1

@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timedelta
 
 from . import config
@@ -25,10 +27,21 @@ def _read(path) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        data.setdefault("records", {})
+        if not isinstance(data, dict):
+            raise ValueError("history.json 顶层不是对象")
+        data.setdefault("records", {})       # 兼容早期没有 records 键的存档
+        if not isinstance(data["records"], dict):
+            raise ValueError("records 不是对象")
         return data
     except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ {path.name} 读取失败，按空历史处理：{exc}")
+        # 原实现会静默按空历史处理，随后 save() 直接覆写，坏文件里的历史就永久没了。
+        # 先留一份带时间戳的备份，再让调用方以空历史继续。
+        backup = path.with_name(f"{path.name}.corrupt-{datetime.now():%Y%m%d%H%M%S}")
+        try:
+            shutil.copy2(path, backup)
+            print(f"⚠️ {path.name} 读取失败，已备份到 {backup.name}：{exc}")
+        except Exception as copy_exc:  # noqa: BLE001
+            print(f"⚠️ {path.name} 读取失败且备份失败：{exc} / {copy_exc}")
         return {"records": {}}
 
 
@@ -46,9 +59,15 @@ def save(hist: dict, keep_days: int = 90) -> None:
     records = hist.get("records", {})
     if len(records) > keep_days:
         hist["records"] = dict(sorted(records.items())[-keep_days:])
-    with open(config.HISTORY_PATH, "w", encoding="utf-8") as f:
+    # 原子写：Actions 被超时杀掉 / 磁盘写一半时，直接 open("w") 会留下截断的
+    # JSON，下次启动按空历史处理，整段积累的历史就没了。
+    tmp = config.HISTORY_PATH.with_name(config.HISTORY_PATH.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(hist, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, config.HISTORY_PATH)
 
 
 def upsert(hist: dict, trade_date: str, stats: dict) -> dict:
@@ -78,6 +97,30 @@ def mark_pushed(hist: dict, trade_date: str, stats: dict, stamp: str) -> dict:
 
     hist["last_push"] = {"date": trade_date, "time": stamp, "stats": rounded(stats)}
     return hist
+
+
+def recently_pushed(hist: dict, trade_date: str, now=None,
+                    hours: int = config.SKIP_WINDOW_HOURS) -> bool:
+    """同一「数据日期」在最近 hours 小时内是否已推送过。
+
+    多档 cron 兜底 20/21/22 点都会触发，靠这个在抓数之前就退出，
+    既不重复刷屏，也不浪费一次全市场抓取。按 last_push 的日期+时间判，
+    --force 由调用方跳过本检查。时间解析不了时保守返回 True（宁可不推）。
+    """
+    last = hist.get("last_push") or {}
+    if last.get("date") != trade_date:
+        return False
+    try:
+        stamp = datetime.strptime(
+            f"{trade_date} {last.get('time') or '00:00:00'}", "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=config.CN_TZ)
+        now = now or datetime.now(config.CN_TZ)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=config.CN_TZ)
+        delta = (now - stamp).total_seconds()
+        return 0 <= delta < hours * 3600
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def recent_rows(hist: dict, today: str, days: int = config.DISPLAY_DAYS) -> list[tuple[str, dict, bool]]:

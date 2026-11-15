@@ -105,25 +105,34 @@ def main(argv: list[str] | None = None) -> int:
         source = "history.json 存档"
         print(f"复用存档：{trade_date}")
     else:
+        hist = history.load()          # 提前加载：交易日/推送判重都要读它
         today = started.date()
+        data_date = today
         if not args.force:
-            ok, reason = sources.is_trading_day(today)
+            ok, data_date, reason = sources.trading_session(today)
             if not ok:
                 print(f"⏭  跳过：{reason}")
                 return 0
             print(f"交易日检查通过：{reason}")
+            if data_date != today:
+                print(f"  ℹ️ 数据按行情日期 {data_date} 记账（运行日 {today}）")
+            if history.recently_pushed(hist, data_date.strftime("%Y-%m-%d"), started):
+                print(f"⏭  {data_date} 近期已推送过，跳过（多档 cron 幂等）")
+                return 0
 
         # 数据源选择带质量校验：不合格的源自动跳过，换下一个。
-        # expected 是代码表里各指数的真实只数，让闸门按比例判而不是绝对只数。
-        validate = lambda its: aggregate.evaluate(its, sources.expected_counts())  # noqa: E731
+        # 基准同时包含各指数只数与「有效候选总数」，闸门按比例判，
+        # 不会再出现「代码表 2100 只、只抓到 1300 只也算合格」的情况。
+        baseline = sources.universe_stats()
+        validate = lambda its: aggregate.evaluate(  # noqa: E731
+            its, baseline.get("indices"), baseline.get("total"))
         items, source = sources.fetch_flow(validate=validate)
         stats, info = validate(items)
-        trade_date = today.strftime("%Y-%m-%d")
+        trade_date = data_date.strftime("%Y-%m-%d")
         print(f"统计完成（{info['total']} 个标的，剔除货币类 {info['cash_excluded']} 只、"
               f"非ETF {info['non_etf']} 只，未归类 {info['unmapped']} 只）")
         print("  " + "  ".join(f"{k}={v:.2f}亿" for k, v in stats.items()))
 
-        hist = history.load()
         if not args.force and history.already_pushed(hist, trade_date, stats):
             print(f"⏭  今天（{trade_date}）已推送过相同数据，跳过；如需重推加 --force")
             return 0
