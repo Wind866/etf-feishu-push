@@ -152,8 +152,24 @@ jobs:
             exit 0
           fi
           git commit -m "chore(data): ETF 历史 $(date +%Y-%m-%d)"
-          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
-          git push origin HEAD:"${GITHUB_REF_NAME}"
+          # 卡片已经发出去了，这一提交只是记账。单次 push 被拒（人工提交 / keep-alive /
+          # 另一个仓库的 bot 刚好推进了 main）会让 history 停在上一交易日：last_push
+          # 没写进去，下一个兜底档会认为「今天还没推」而再发一张卡。所以这里与
+          # relay / BIGApush keep-alive 保持同一套「rebase 后重试 3 次」。
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
+            || { git rebase --abort 2>/dev/null || true; }
+          for i in 1 2 3; do
+            if git push origin HEAD:"${GITHUB_REF_NAME}"; then
+              echo "已推送（第 $i 次尝试）"
+              exit 0
+            fi
+            echo "::warning::推送失败（第 $i 次），rebase 后重试"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
+              || { git rebase --abort 2>/dev/null || true; }
+            sleep $((i * 2))
+          done
+          echo "::error::连续 3 次推送失败，history.json 未入库（下一档可能重复推送）"
+          exit 1
 
       - name: 失败告警
         if: failure()
