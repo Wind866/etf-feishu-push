@@ -209,5 +209,46 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertNotIn('curl -sS -X POST "$HOOK"', src)
 
 
+class TestBackfillIsDecoupled(unittest.TestCase):
+    """回补必须在**独立作业**里跑：内联执行会撑爆推送作业的 30 分钟上限，
+    连带跳过 Commit history，当天推送记录一起丢失（2026-11-16 实际发生过）。"""
+
+    def test_auto_backfill_only_writes_marker(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / ".needs_backfill"
+            hist = {"records": {"2026-11-13": {"metric": config.METRIC}}}
+            with patch.object(push, "BACKFILL_MARKER", marker), \
+                 patch.object(sources, "trade_calendar", return_value=[]), \
+                 patch("backfill.main") as inline_backfill:
+                push._auto_backfill(hist, "2026-11-16")
+            self.assertFalse(inline_backfill.called, "回补不得在推送作业内联执行")
+            self.assertTrue(marker.exists(), "应留下回补标记供 workflow 派发")
+            self.assertIn("2026-11-16", marker.read_text(encoding="utf-8"))
+
+    def test_no_marker_when_history_complete(self):
+        import tempfile
+        from pathlib import Path
+
+        calendar = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05",
+                    "2026-11-06", "2026-11-09", "2026-11-10", "2026-11-11",
+                    "2026-11-12", "2026-11-13", "2026-11-16"]
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / ".needs_backfill"
+            hist = {"records": {d: {"metric": config.METRIC} for d in calendar}}
+            with patch.object(push, "BACKFILL_MARKER", marker), \
+                 patch.object(sources, "trade_calendar", return_value=calendar):
+                push._auto_backfill(hist, "2026-11-16")
+            self.assertFalse(marker.exists(), "历史完整时不应留下标记")
+
+    def test_workflow_dispatches_backfill_job(self):
+        src = (ROOT / ".github/workflows/daily-push.yml").read_text(encoding="utf-8")
+        self.assertIn("Dispatch backfill", src)
+        self.assertIn("gh workflow run", src)
+        self.assertIn("actions: write", src)
+
+
 if __name__ == "__main__":
     unittest.main()
