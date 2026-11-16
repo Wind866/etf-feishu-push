@@ -4,7 +4,7 @@
 
 一次运行的完整链路：
     交易日判定 → 抓取全市场 ETF 主力净流入 → 按指数归类汇总（亿元）
-    → 落库 data/history.json → 渲染近 10 个交易日对照表 → 推送飞书
+    → 落库 data/history.json → 渲染近 20 个交易日对照表 → 推送飞书
 
 用法：
     python push.py                    # 抓取 + 推送（Actions 里就是这一条）
@@ -25,7 +25,7 @@ push2/push2his 接口，镜像只是同一集群的不同 svr 域名。所以「
 这是指标本身的客观限制：ETF 主力净流入只有东财提供，换别家等于换口径。
 因此这里的降级路径不是「再找一个源」，而是**T+1 回补**：当天全挂时本次
 照实失败并告警，第二天的日线接口（fetch_history）能把这一天的数补回来，
-10 日对照表不会永久缺一格 —— 见 `_auto_backfill()`。
+近 20 个交易日的对照表不会永久缺一格 —— 见 `_auto_backfill()`。
 """
 
 from __future__ import annotations
@@ -37,6 +37,9 @@ import traceback
 from datetime import datetime, timedelta
 
 from etfpush import aggregate, config, feishu, history, render, sources
+
+# 回补标记：本作业只留标记，由 workflow 派发独立的 backfill 作业（见 _auto_backfill）
+BACKFILL_MARKER = config.ROOT / "data" / ".needs_backfill"
 
 
 def _now():
@@ -96,47 +99,53 @@ def _backfill_reason(hist: dict, trade_date: str) -> str | None:
 
     原版只看「近 20 天记录数 < DISPLAY_DAYS」，只覆盖新仓库冷启动：
     中途某天被东财限流漏推时记录数仍是 10，函数直接返回 —— 缺的那一格
-    永远补不上，与文档承诺的「10 日对照表不会永久缺一格」不符。
+    永远补不上，与文档承诺的「对照表不会永久缺一格」不符。
 
     这里加一道**精确缺口检测**：用上证指数日 K 当交易日历（每个交易日
     必有 K 线，周末/节假日天然缺席，见 sources.trade_calendar），找出
-    近 20 个自然日内「真实交易日却没进 history.json」的日子。
+    检测窗口内「真实交易日却没进 history.json」的日子。
       * 节假日不会误报（不在日历里）；
       * 真漏推的日子每天重试直到补上，正是期望行为；
       * 日历探测失败时保守返回 None（回补是锦上添花，不能误触发）。
+
+    窗口必须覆盖 DISPLAY_DAYS 个交易日：20 个交易日 ≈ 28 个自然日，
+    取 2 倍（40 个自然日）留出长假余量；日历也相应多取一些。
     """
     records = sorted(hist.get("records") or {})
+    window_days = config.DISPLAY_DAYS * 2
     try:
         since = (datetime.strptime(trade_date, "%Y-%m-%d")
-                 - timedelta(days=20)).strftime("%Y-%m-%d")
+                 - timedelta(days=window_days)).strftime("%Y-%m-%d")
     except ValueError:
         return None
     have = sum(1 for d in records if d >= since)
     if have < config.DISPLAY_DAYS:
-        return (f"近 20 天只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史"
+        return (f"检测窗口内只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史"
                 "（冷启动或长期缺数）")
-    missing = [d for d in sources.trade_calendar(lmt=40)
+    missing = [d for d in sources.trade_calendar(lmt=window_days + 10)
                if since <= d <= trade_date and d not in set(records)]
     if missing:
-        return f"近 20 天内有真实交易日缺记录：{missing}"
+        return f"检测窗口内有真实交易日缺记录：{missing}"
     return None
 
 
 def _auto_backfill(hist: dict, trade_date: str) -> None:
-    """历史不足或有缺口时，顺手补一轮（**推送成功之后**才调用）。
+    """历史不足或有缺口时只**留下标记**，由 workflow 派发独立的回补作业。
 
-    新仓库上线后 history.json 只有当天一条：10 日对照表要干等两周才长出来；
-    中途某天被东财限流漏推，那张表也会永久缺一格。指望人记得去点
-    workflow_dispatch(mode=backfill) 并不现实，所以这里自动补，触发条件
-    （满足其一，见 _backfill_reason）：
+    为什么不在推送作业里直接补（v1 做法已废弃）：回补要逐只取日线——
+    1800 只 × 约 0.5s，加缓存与限流重试普遍 10~15 分钟；而推送作业的
+    上限是 30 分钟。内联执行会把整个作业拖到超时，连 `Commit history`
+    一起跳过，当天的推送记录也随之丢失（2026-11-16 12:48 的运行实际
+    发生了：飞书卡片已发出，history.json 却没入库）。
+
+    现在的分工：本函数只在 `data/.needs_backfill` 写一行原因，作业末尾
+    根据这个标记 `gh workflow run ... mode=backfill`，让回补在**另一个**
+    作业里用完整的 30 分钟预算跑。触发条件仍由 _backfill_reason 决定：
 
       * 近 20 个自然日内的记录数 < DISPLAY_DAYS（刚开始积累、长期缺数）；
       * 日历检测到近 20 天内有真实交易日缺记录（单日漏推的精确修复）。
 
-    补齐即停：历史完整时这个函数什么都不做。复用 backfill.py 的断点
-    缓存与完整性闸门，补出来的数与当日推送同口径。必须放在「推送成功、
-    推送状态已写」之后：补历史是锦上添花，不能因为它失败就把当天的
-    推送判成失败 —— 所有异常都在这里吞掉并记录。
+    历史完整时这个函数什么都不做。写标记失败不影响已完成推送。
     """
     if os.environ.get("AUTO_BACKFILL", "1").strip() == "0":
         print("ℹ️ AUTO_BACKFILL=0，跳过多日历史自动回补")
@@ -144,16 +153,14 @@ def _auto_backfill(hist: dict, trade_date: str) -> None:
     reason = _backfill_reason(hist, trade_date)
     if not reason:
         return
-    print(f"🧩 自动回补历史：{reason}")
+    print(f"🧩 需要回补历史：{reason}")
+    print("   回补需 10 分钟以上，不在本作业内执行；"
+          "已留下标记，由 workflow 派发独立的回补作业")
     try:
-        import backfill  # noqa: PLC0415 - 日常推送不需要它，延迟导入
-        # 原来只补最近 10 个交易日：缺口落在第 11~14 个交易日时永远追不上，
-        # 会变成每天空跑。--days 20 覆盖整个 20 个自然日检测窗口。
-        backfill.main(["--days", "20"])
-    except SystemExit as exc:
-        print(f"⚠️ 自动回补提前结束（exit={exc.code}），历史可能仍不完整")
+        BACKFILL_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        BACKFILL_MARKER.write_text(f"{trade_date}\t{reason}\n", encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - 绝不能影响已完成的推送
-        print(f"⚠️ 自动回补失败（不影响本次推送）：{type(exc).__name__}: {exc}")
+        print(f"⚠️ 写回补标记失败（不影响本次推送）：{type(exc).__name__}: {exc}")
 
 
 def main(argv: list[str] | None = None) -> int:

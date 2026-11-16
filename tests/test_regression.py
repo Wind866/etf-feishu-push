@@ -153,10 +153,20 @@ class TestAutoBackfillTrigger(unittest.TestCase):
         return {"records": {d: {"metric": config.METRIC, "所有ETF": 0.0}
                             for d in dates}}
 
-    # 2026-11 前三周的真实交易日（11-14/15、11-07/08 为周末）
-    CALENDAR = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05",
-                "2026-11-06", "2026-11-09", "2026-11-10", "2026-11-11",
-                "2026-11-12", "2026-11-13", "2026-11-16"]
+    # 2026-09-28 ~ 2026-11-16 的工作日（不含节假日，测试用日历只需足够长：
+    # DISPLAY_DAYS=20 → 检测窗口 40 个自然日 ≈ 28 个交易日，日历须 ≥ 20 条）
+    @staticmethod
+    def _weekdays(start: str, end: str) -> list[str]:
+        from datetime import date, timedelta
+        d0, d1 = date.fromisoformat(start), date.fromisoformat(end)
+        out, d = [], d0
+        while d <= d1:
+            if d.weekday() < 5:
+                out.append(d.isoformat())
+            d += timedelta(days=1)
+        return out
+
+    CALENDAR = _weekdays.__func__("2026-09-28", "2026-11-16")
 
     def test_missing_trade_day_triggers_backfill(self):
         # 周一 11-16 被限流漏推：有缺口，必须触发
@@ -173,8 +183,8 @@ class TestAutoBackfillTrigger(unittest.TestCase):
         self.assertIsNone(reason)
 
     def test_calendar_failure_is_conservative(self):
-        # 日历探测失败且历史已满 10 天：保守不触发（回补不能误伤）
-        dates = self.CALENDAR[:10]
+        # 日历探测失败且历史已满 DISPLAY_DAYS 天：保守不触发（回补不能误伤）
+        dates = self.CALENDAR[-config.DISPLAY_DAYS:]
         with patch.object(sources, "trade_calendar", return_value=[]):
             reason = push._backfill_reason(self._hist(dates), "2026-11-16")
         self.assertIsNone(reason)
@@ -186,13 +196,12 @@ class TestAutoBackfillTrigger(unittest.TestCase):
         self.assertIsNotNone(reason)
 
     def test_gap_outside_window_is_ignored(self):
-        # 缺口在 20 个自然日窗口之外（老记录）不在自动回补范围内
-        old = ["2026-10-12", "2026-10-13", "2026-10-14"]
-        recent = self.CALENDAR
+        # 缺口在检测窗口之外（老记录）不在自动回补范围内
+        old = ["2026-08-10", "2026-08-11", "2026-08-12"]
         with patch.object(sources, "trade_calendar",
                           return_value=old + self.CALENDAR):
             reason = push._backfill_reason(
-                self._hist(old + [d for d in recent if d != "2026-11-16"]),
+                self._hist(old + [d for d in self.CALENDAR if d != "2026-11-16"]),
                 "2026-11-16")
         # 11-16 在窗口内缺记录 → 仍应触发（缺口本身在窗口内才管）
         self.assertIsNotNone(reason)
@@ -207,6 +216,52 @@ class TestWorkflowContract(unittest.TestCase):
         src = (ROOT / ".github/workflows/daily-push.yml").read_text(encoding="utf-8")
         self.assertIn("feishu.send", src)
         self.assertNotIn('curl -sS -X POST "$HOOK"', src)
+
+
+class TestBackfillIsDecoupled(unittest.TestCase):
+    """回补必须在**独立作业**里跑：内联执行会撑爆推送作业的 30 分钟上限，
+    连带跳过 Commit history，当天推送记录一起丢失（2026-11-16 实际发生过）。"""
+
+    def test_auto_backfill_only_writes_marker(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / ".needs_backfill"
+            hist = {"records": {"2026-11-13": {"metric": config.METRIC}}}
+            with patch.object(push, "BACKFILL_MARKER", marker), \
+                 patch.object(sources, "trade_calendar", return_value=[]), \
+                 patch("backfill.main") as inline_backfill:
+                push._auto_backfill(hist, "2026-11-16")
+            self.assertFalse(inline_backfill.called, "回补不得在推送作业内联执行")
+            self.assertTrue(marker.exists(), "应留下回补标记供 workflow 派发")
+            self.assertIn("2026-11-16", marker.read_text(encoding="utf-8"))
+
+    def test_no_marker_when_history_complete(self):
+        import tempfile
+        from pathlib import Path
+        from datetime import date, timedelta
+
+        # 生成 ≥ DISPLAY_DAYS 个工作日（与 DISPLAY_DAYS=20 对齐）
+        calendar, d = [], date(2026, 9, 28)
+        while len(calendar) < config.DISPLAY_DAYS + 5:
+            if d.weekday() < 5:
+                calendar.append(d.isoformat())
+            d += timedelta(days=1)
+        trade_date = calendar[-1]
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / ".needs_backfill"
+            hist = {"records": {d: {"metric": config.METRIC} for d in calendar}}
+            with patch.object(push, "BACKFILL_MARKER", marker), \
+                 patch.object(sources, "trade_calendar", return_value=calendar):
+                push._auto_backfill(hist, trade_date)
+            self.assertFalse(marker.exists(), "历史完整时不应留下标记")
+
+    def test_workflow_dispatches_backfill_job(self):
+        src = (ROOT / ".github/workflows/daily-push.yml").read_text(encoding="utf-8")
+        self.assertIn("Dispatch backfill", src)
+        self.assertIn("gh workflow run", src)
+        self.assertIn("actions: write", src)
 
 
 if __name__ == "__main__":

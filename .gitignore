@@ -16,3 +16,6 @@ snapshots/
 # 历史回补的断点缓存（临时文件，不进仓库）
 data/.hist_cache.json
 data/.hist_cache.tmp
+
+# 回补标记（push.py 留标记，workflow 据此派发独立回补作业；运行期临时文件）
+data/.needs_backfill

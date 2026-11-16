@@ -34,7 +34,7 @@ on:
 
 permissions:
   contents: write          # 需要把 data/history.json 提交回仓库，才能累积多日对照
-  actions: read
+  actions: write           # 需要派发独立的 backfill 作业（见 Dispatch backfill 步骤）
 
 concurrency:
   group: etf-flow-push
@@ -43,7 +43,7 @@ concurrency:
 jobs:
   push:
     runs-on: ubuntu-latest
-    timeout-minutes: 30          # 回补历史需要逐只取日线，留足余量
+    timeout-minutes: 40          # 回补作业要逐只取日线（约 15 分钟），留足余量；推送本身仅 2~3 分钟
 
     steps:
       - name: Checkout
@@ -175,6 +175,21 @@ jobs:
           done
           echo "::error::连续 3 次推送失败，history.json 未入库（下一档可能重复推送）"
           exit 1
+
+      # 历史有缺口时，push.py 会留下 data/.needs_backfill 标记。回补要逐只取
+      # 日线（10~15 分钟），塞进本作业会把 30 分钟预算撑爆并连带丢掉
+      # Commit history（2026-11-16 12:48 实际发生过），所以在这里派发一个
+      # **独立**的 backfill 作业，让它用自己完整的超时预算去跑。
+      - name: Dispatch backfill
+        if: success() && hashFiles('data/.needs_backfill') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "检测到历史缺口：$(cat data/.needs_backfill)"
+          gh workflow run daily-push.yml --ref "${GITHUB_REF_NAME}" \
+            -f mode=backfill -f days=20 \
+            && echo "已派发独立回补作业" \
+            || echo "::warning::派发回补作业失败（下一档推送会再次留标记重试）"
 
       - name: 失败告警
         if: failure()
