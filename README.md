@@ -18,7 +18,7 @@
         │
         ├─ 交易日判定   取上证指数最新行情时间戳，并把它作为「数据日期」记账
         ├─ 抓取数据     天天基金代码表 → 东财 ulist 批量取 f62（主力净流入）
-        ├─ 归类汇总     8 个宽基指数 × 近 10 个交易日，元 → 亿元
+        ├─ 归类汇总     8 个宽基指数 × 近 20 个交易日，元 → 亿元
         ├─ 写入历史     data/history.json（Actions 自动 commit 回仓库）
         └─ 出图并推送   PIL 画表 → 飞书图片消息（无应用凭证时降级为卡片）
 ```
@@ -318,7 +318,7 @@ python push.py
 不能用于这张表。腾讯 `ff_` 不支持 ETF；新浪对 ETF 的资金流与东财口径不一致，实测会出现符号相反的数值。真要独立源，建议接 Tushare/Choice 等付费数据（需自己改 `etfpush/sources.py` 的 `SOURCES`）。
 
 **Q：为什么第一次跑出来的表只有一行？**
-数据是逐日累积的。`data/history.json` 每跑一次记一天，跑满 10 个交易日就自动是 10 行。想先看满是 10 行的效果，用 `--demo`。
+数据是逐日累积的。`data/history.json` 每跑一次记一天，跑满 20 个交易日就自动是 20 行。想先看满是 10 行的效果，用 `--demo`。
 
 **Q：Action 显示成功，但没有提交 history.json？**
 保持默认分支是 `main`，且仓库 Settings → Actions → General → Workflow permissions 选 **Read and write permissions**。

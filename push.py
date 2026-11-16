@@ -4,7 +4,7 @@
 
 一次运行的完整链路：
     交易日判定 → 抓取全市场 ETF 主力净流入 → 按指数归类汇总（亿元）
-    → 落库 data/history.json → 渲染近 10 个交易日对照表 → 推送飞书
+    → 落库 data/history.json → 渲染近 20 个交易日对照表 → 推送飞书
 
 用法：
     python push.py                    # 抓取 + 推送（Actions 里就是这一条）
@@ -25,7 +25,7 @@ push2/push2his 接口，镜像只是同一集群的不同 svr 域名。所以「
 这是指标本身的客观限制：ETF 主力净流入只有东财提供，换别家等于换口径。
 因此这里的降级路径不是「再找一个源」，而是**T+1 回补**：当天全挂时本次
 照实失败并告警，第二天的日线接口（fetch_history）能把这一天的数补回来，
-10 日对照表不会永久缺一格 —— 见 `_auto_backfill()`。
+近 20 个交易日的对照表不会永久缺一格 —— 见 `_auto_backfill()`。
 """
 
 from __future__ import annotations
@@ -99,29 +99,33 @@ def _backfill_reason(hist: dict, trade_date: str) -> str | None:
 
     原版只看「近 20 天记录数 < DISPLAY_DAYS」，只覆盖新仓库冷启动：
     中途某天被东财限流漏推时记录数仍是 10，函数直接返回 —— 缺的那一格
-    永远补不上，与文档承诺的「10 日对照表不会永久缺一格」不符。
+    永远补不上，与文档承诺的「对照表不会永久缺一格」不符。
 
     这里加一道**精确缺口检测**：用上证指数日 K 当交易日历（每个交易日
     必有 K 线，周末/节假日天然缺席，见 sources.trade_calendar），找出
-    近 20 个自然日内「真实交易日却没进 history.json」的日子。
+    检测窗口内「真实交易日却没进 history.json」的日子。
       * 节假日不会误报（不在日历里）；
       * 真漏推的日子每天重试直到补上，正是期望行为；
       * 日历探测失败时保守返回 None（回补是锦上添花，不能误触发）。
+
+    窗口必须覆盖 DISPLAY_DAYS 个交易日：20 个交易日 ≈ 28 个自然日，
+    取 2 倍（40 个自然日）留出长假余量；日历也相应多取一些。
     """
     records = sorted(hist.get("records") or {})
+    window_days = config.DISPLAY_DAYS * 2
     try:
         since = (datetime.strptime(trade_date, "%Y-%m-%d")
-                 - timedelta(days=20)).strftime("%Y-%m-%d")
+                 - timedelta(days=window_days)).strftime("%Y-%m-%d")
     except ValueError:
         return None
     have = sum(1 for d in records if d >= since)
     if have < config.DISPLAY_DAYS:
-        return (f"近 20 天只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史"
+        return (f"检测窗口内只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史"
                 "（冷启动或长期缺数）")
-    missing = [d for d in sources.trade_calendar(lmt=40)
+    missing = [d for d in sources.trade_calendar(lmt=window_days + 10)
                if since <= d <= trade_date and d not in set(records)]
     if missing:
-        return f"近 20 天内有真实交易日缺记录：{missing}"
+        return f"检测窗口内有真实交易日缺记录：{missing}"
     return None
 
 
