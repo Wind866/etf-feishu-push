@@ -111,73 +111,82 @@ def _fmt(value) -> tuple[str, tuple]:
 def render_table(rows: list[tuple[str, dict, bool]], columns: list[str],
                  title: str, subtitle: str, footnotes: list[str], path: str,
                  today_label: str | None = "今日") -> str:
-    """rows: [(日期 MM/DD, {列名: 数值}, 是否今日)]，自上而下按时间升序。"""
-    width = PAD_X * 2 + W_DATE + W_COL * len(columns)
-    height = H_TITLE + H_HEAD + H_ROW * len(rows) + H_FOOT
+    """rows: [(日期 MM/DD, {列名: 数值}, 是否今日)]，自上而下按时间升序。
+
+    出图按 config.RENDER_SCALE 超采样（默认 2x）：所有尺寸与字号成倍放大后
+    直接保存高分辨率 PNG。飞书端按屏宽缩放显示，2x 源缩出来的文字边缘
+    明显比 1x 源锐利；图内布局比例与 1x 完全一致。
+    """
+    s = max(1, int(getattr(config, "RENDER_SCALE", 1)))
+    w_date, w_col, pad_x = W_DATE * s, W_COL * s, PAD_X * s
+    h_title, h_head, h_row, h_foot = H_TITLE * s, H_HEAD * s, H_ROW * s, H_FOOT * s
+
+    width = pad_x * 2 + w_date + w_col * len(columns)
+    height = h_title + h_head + h_row * len(rows) + h_foot
     img = Image.new("RGB", (width, height), C_BG)
     draw = ImageDraw.Draw(img)
 
     # ---------- 标题 ----------
-    draw.text((PAD_X, 30), title, font=_font(44, True), fill=C_TITLE)
-    draw.text((PAD_X, 86), subtitle, font=_font(25), fill=C_SUB)
+    draw.text((pad_x, 30 * s), title, font=_font(44 * s, True), fill=C_TITLE)
+    draw.text((pad_x, 86 * s), subtitle, font=_font(25 * s), fill=C_SUB)
 
     # ---------- 表头 ----------
-    top, right = H_TITLE, width - PAD_X
-    draw.rectangle([PAD_X, top, right, top + H_HEAD], fill=C_HEAD_BG)
-    f_head = _font(32, True)
+    top, right = h_title, width - pad_x
+    draw.rectangle([pad_x, top, right, top + h_head], fill=C_HEAD_BG)
+    f_head = _font(32 * s, True)
     box = draw.textbbox((0, 0), "日期", font=f_head)
-    draw.text((PAD_X + 22, top + (H_HEAD - (box[3] - box[1])) / 2 - box[1]),
+    draw.text((pad_x + 22 * s, top + (h_head - (box[3] - box[1])) / 2 - box[1]),
               "日期", font=f_head, fill=C_HEAD_TX)
     for i, col in enumerate(columns):
-        _draw_center(draw, col, f_head, PAD_X + W_DATE + W_COL * i, W_COL,
-                     top, H_HEAD, C_HEAD_TX)
-    draw.line([PAD_X, top + H_HEAD, right, top + H_HEAD], fill=C_HEAD_LINE, width=2)
+        _draw_center(draw, col, f_head, pad_x + w_date + w_col * i, w_col,
+                     top, h_head, C_HEAD_TX)
+    draw.line([pad_x, top + h_head, right, top + h_head], fill=C_HEAD_LINE, width=2 * s)
 
     # ---------- 数据行 ----------
-    f_date, f_num = _font(28), _font(24)
-    f_tag = _font(20, True)
-    y = top + H_HEAD
+    f_date, f_num = _font(28 * s), _font(24 * s)
+    f_tag = _font(20 * s, True)
+    y = top + h_head
     for idx, (date_txt, record, is_today) in enumerate(rows):
         if is_today:
-            draw.rectangle([PAD_X, y, right, y + H_ROW], fill=C_TODAY_BG)
+            draw.rectangle([pad_x, y, right, y + h_row], fill=C_TODAY_BG)
         elif idx % 2 == 1:
-            draw.rectangle([PAD_X, y, right, y + H_ROW], fill=C_ROW_ALT)
+            draw.rectangle([pad_x, y, right, y + h_row], fill=C_ROW_ALT)
 
         box = draw.textbbox((0, 0), date_txt, font=f_date)
-        draw.text((PAD_X + 22, y + (H_ROW - (box[3] - box[1])) / 2 - box[1]),
+        draw.text((pad_x + 22 * s, y + (h_row - (box[3] - box[1])) / 2 - box[1]),
                   date_txt, font=f_date, fill=C_TITLE)
 
         if is_today and today_label:
             tw = _text_width(draw, today_label, f_tag)
-            tag_x = PAD_X + 22 + _text_width(draw, date_txt, f_date) + 12
-            tag_y = y + (H_ROW - 30) / 2
-            draw.rounded_rectangle([tag_x, tag_y, tag_x + tw + 16, tag_y + 30],
-                                   radius=15, fill=C_TODAY_TAG)
+            tag_x = pad_x + 22 * s + _text_width(draw, date_txt, f_date) + 12 * s
+            tag_y = y + (h_row - 30 * s) / 2
+            draw.rounded_rectangle([tag_x, tag_y, tag_x + tw + 16 * s, tag_y + 30 * s],
+                                   radius=15 * s, fill=C_TODAY_TAG)
             box2 = draw.textbbox((0, 0), today_label, font=f_tag)
-            draw.text((tag_x + 8, tag_y + (30 - (box2[3] - box2[1])) / 2 - box2[1]),
+            draw.text((tag_x + 8 * s, tag_y + (30 * s - (box2[3] - box2[1])) / 2 - box2[1]),
                       today_label, font=f_tag, fill=(255, 255, 255))
 
         for i, col in enumerate(columns):
             text, color = _fmt(record.get(col))
-            _draw_center(draw, text, f_num, PAD_X + W_DATE + W_COL * i, W_COL,
-                         y, H_ROW, color)
+            _draw_center(draw, text, f_num, pad_x + w_date + w_col * i, w_col,
+                         y, h_row, color)
 
-        y += H_ROW
-        draw.line([PAD_X, y, right, y], fill=C_LINE, width=1)
+        y += h_row
+        draw.line([pad_x, y, right, y], fill=C_LINE, width=1 * s)
 
     # ---------- 边框与竖线 ----------
-    draw.rectangle([PAD_X, top, right, y], outline=C_BORDER, width=2)
-    divider = PAD_X + W_DATE
-    draw.line([divider, top, divider, y], fill=C_HEAD_LINE, width=2)
+    draw.rectangle([pad_x, top, right, y], outline=C_BORDER, width=2 * s)
+    divider = pad_x + w_date
+    draw.line([divider, top, divider, y], fill=C_HEAD_LINE, width=2 * s)
     for i in range(1, len(columns)):
-        x = PAD_X + W_DATE + W_COL * i
-        draw.line([x, top + H_HEAD, x, y], fill=C_LINE, width=1)
+        x = pad_x + w_date + w_col * i
+        draw.line([x, top + h_head, x, y], fill=C_LINE, width=1 * s)
 
     # ---------- 底部注释 ----------
-    fy = y + 26
+    fy = y + 26 * s
     for line in footnotes:
-        draw.text((PAD_X, fy), line, font=_font(24), fill=C_FOOT)
-        fy += 34
+        draw.text((pad_x, fy), line, font=_font(24 * s), fill=C_FOOT)
+        fy += 34 * s
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     img.save(path, "PNG", optimize=True)
