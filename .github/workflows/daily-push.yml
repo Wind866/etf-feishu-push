@@ -93,6 +93,11 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          # 可选：东财转发代理（见 worker/em-proxy.js）。东财把 runner 数据中心
+          # 段整段掐断时，配置这两个 Secrets 借道 Cloudflare Worker 中继；
+          # 不配置时代理通道自动关闭，行为与原来完全一致。
+          EM_PROXY_URL: ${{ secrets.EM_PROXY_URL }}
+          EM_PROXY_TOKEN: ${{ secrets.EM_PROXY_TOKEN }}
           # 失败告警统一由下面的 workflow 步骤发送，关掉脚本内那条，避免群里收到两条
           ALERT_ON_FAIL: "0"
           TZ: Asia/Shanghai

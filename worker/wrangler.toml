@@ -1,0 +1,8 @@
+name = "etf-em-proxy"
+main = "em-proxy.js"
+compatibility_date = "2026-01-01"
+
+# 部署前先配密钥（与本仓库 Secret EM_PROXY_TOKEN 保持一致）：
+#   wrangler secret put PROXY_TOKEN
+# 部署：
+#   wrangler deploy

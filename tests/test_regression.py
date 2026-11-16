@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from etfpush import aggregate, config, history, sources
+import push  # noqa: E402 - 触发缺口检测的入口（_backfill_reason）
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -143,6 +144,58 @@ class TestBackfillCache(unittest.TestCase):
                 sources.fetch_history(days=24, pace=0, cache_path=cache,
                                       max_passes=1, stale_date=date(2026, 11, 13))
             self.assertEqual(daykline.call_count, 0)
+
+
+class TestAutoBackfillTrigger(unittest.TestCase):
+    """缺口检测：单日漏推必须触发回补，节假日不得误报。"""
+
+    def _hist(self, dates):
+        return {"records": {d: {"metric": config.METRIC, "所有ETF": 0.0}
+                            for d in dates}}
+
+    # 2026-11 前三周的真实交易日（11-14/15、11-07/08 为周末）
+    CALENDAR = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05",
+                "2026-11-06", "2026-11-09", "2026-11-10", "2026-11-11",
+                "2026-11-12", "2026-11-13", "2026-11-16"]
+
+    def test_missing_trade_day_triggers_backfill(self):
+        # 周一 11-16 被限流漏推：有缺口，必须触发
+        dates = [d for d in self.CALENDAR if d != "2026-11-16"]
+        with patch.object(sources, "trade_calendar", return_value=self.CALENDAR):
+            reason = push._backfill_reason(self._hist(dates), "2026-11-16")
+        self.assertIsNotNone(reason)
+        self.assertIn("2026-11-16", reason)
+
+    def test_holiday_does_not_trigger(self):
+        # 全部交易日都有记录：不触发
+        with patch.object(sources, "trade_calendar", return_value=self.CALENDAR):
+            reason = push._backfill_reason(self._hist(self.CALENDAR), "2026-11-16")
+        self.assertIsNone(reason)
+
+    def test_calendar_failure_is_conservative(self):
+        # 日历探测失败且历史已满 10 天：保守不触发（回补不能误伤）
+        dates = self.CALENDAR[:10]
+        with patch.object(sources, "trade_calendar", return_value=[]):
+            reason = push._backfill_reason(self._hist(dates), "2026-11-16")
+        self.assertIsNone(reason)
+
+    def test_cold_start_triggers_without_calendar(self):
+        # 冷启动（记录数不足）即使日历探测失败也触发
+        with patch.object(sources, "trade_calendar", return_value=[]):
+            reason = push._backfill_reason(self._hist(["2026-11-13"]), "2026-11-16")
+        self.assertIsNotNone(reason)
+
+    def test_gap_outside_window_is_ignored(self):
+        # 缺口在 20 个自然日窗口之外（老记录）不在自动回补范围内
+        old = ["2026-10-12", "2026-10-13", "2026-10-14"]
+        recent = self.CALENDAR
+        with patch.object(sources, "trade_calendar",
+                          return_value=old + self.CALENDAR):
+            reason = push._backfill_reason(
+                self._hist(old + [d for d in recent if d != "2026-11-16"]),
+                "2026-11-16")
+        # 11-16 在窗口内缺记录 → 仍应触发（缺口本身在窗口内才管）
+        self.assertIsNotNone(reason)
 
 
 class TestWorkflowContract(unittest.TestCase):

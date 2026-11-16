@@ -46,6 +46,8 @@
 | `FEISHU_APP_SECRET` | 可选 | 飞书自建应用 App Secret |
 | `ALERT_WEBHOOK` | 建议 | 独立告警机器人 Webhook；业务 webhook 挂掉时告警仍能发出 |
 | `ALERT_SECRET` | 可选 | 独立告警机器人的签名密钥 |
+| `EM_PROXY_URL` | 可选 | 东财转发代理地址（如 `https://etf-em-proxy.<account>.workers.dev/em`），见下方「转发代理」 |
+| `EM_PROXY_TOKEN` | 可选 | 转发代理共享密钥，与 Worker 的 `PROXY_TOKEN` 一致 |
 
 > **加签要么两个机器人都开，要么都不开。** 只开一半不是「部分失效」而是全链路静默：
 > 业务推送被拒（`19021`，HTTP 仍 200）→ 触发 `if: failure()` 告警 → 告警机器人同样要求
@@ -120,6 +122,33 @@ gh secret set ALERT_SECRET  --body '<告警机器人签名密钥>' --repo Wind86
 上面每个通道都会在 **15 个东财镜像**之间轮换（`push2` / `push2delay` /
 `1.push2` … `99.push2`，后端 `svr` 号各不相同）。分批请求时起始镜像也滚动，
 压力天然分散；连续 3 批全镜像失败则**熔断**，不再空等超时，把时间让给下一个通道。
+
+### 转发代理（可选，东财封 runner IP 时的解法）
+
+东财会对 GitHub runner 的数据中心 IP 段做整段封锁（TLS 中途 EOF / 502），
+本地却一切正常——这是环境限制，多档 cron 重试只是缓解。根治办法是借道
+Cloudflare Worker 中继：仓库内置 `worker/em-proxy.js`，部署后配置两个
+Secrets 即可，代理失败会自动回退直连，代理挂掉不影响原有链路。
+
+```bash
+cd worker
+wrangler secret put PROXY_TOKEN     # 自己生成一个随机串
+wrangler deploy
+# 得到 https://etf-em-proxy.<你的账号>.workers.dev/em
+```
+
+然后在本仓库 Secrets 里配置：
+
+| Name | 值 |
+| --- | --- |
+| `EM_PROXY_URL` | `https://etf-em-proxy.<你的账号>.workers.dev/em` |
+| `EM_PROXY_TOKEN` | 与上面 `PROXY_TOKEN` 相同的随机串 |
+
+安全设计：Worker 校验共享密钥（未配置密钥直接拒绝服务，不做开放代理），
+且只允许中继 `*.eastmoney.com`；Python 侧也只对东财域名启用代理通道，
+腾讯/新浪/天天基金探测仍走直连。`python push.py --probe` 会逐项报告代理状态。
+也可以把 `/em` 分支并入你现有的 gh-actions-scheduler Worker（同一份代码抄过去、
+env 里加同一个 `PROXY_TOKEN`），不必单独部署。
 
 镜像还带**健康打分**：失败的主机记一分、成功减一分，后续批次自动排到后面，
 不会每批都先撞一遍坏主机（GitHub runner 上实测某些镜像会间歇性返回空响应）。
@@ -239,6 +268,9 @@ python push.py
 │   └── demo_history.json       # 演示数据（只读）
 ├── docs/preview.png            # 预览图
 ├── backfill.py                 # 历史回补（也可由 daily-push 的 backfill 模式调用）
+├── worker/                     # 可选：Cloudflare 转发代理（东财封 runner IP 时）
+│   ├── em-proxy.js             # 中继脚本（域名校验 + 共享密钥防滥用）
+│   └── wrangler.toml           # wrangler 部署配置
 ├── requirements.txt            # 核心依赖
 ├── requirements-optional.txt   # 可选兜底数据源
 ├── tests/                      # 回归 / 冒烟测试（CI 依赖）
@@ -267,7 +299,10 @@ python push.py
 旧版断点缓存只看「代码在不在缓存里」，第一次写满后日线接口就再也不会被调用，
 新交易日永远补不进来，而 workflow 还把这份旧缓存提交回仓库把状态固化了。
 现在缓存按「缓存里最新日期 vs 最新行情日」自动失效，出现新交易日就全量重取；
-也可以手动勾选 `refresh` 强制重取。回补闸门已统一为 1200 只，和当日推送同口径。
+也可以手动勾选 `refresh` 强制重取。回补闸门与当日推送完全同口径
+（动态比例闸门，见上方「完整性闸门」一节）。另外，当日推送成功后会自动做一次
+**缺口检测**：用上证指数日 K 当交易日历，发现近 20 天内有「真实交易日缺记录」
+就自动回补，单日漏推的缺口不再永久留在表里。
 
 **Q：所有东财接口都挂了会怎样？**
 三个通道依次尝试，都失败则**不推送**并往群里发一条失败告警（`ALERT_ON_FAIL=0` 可关）。宁可当天缺一条，也不发残缺或错口径的数据。

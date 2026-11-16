@@ -21,10 +21,11 @@ import sys
 
 from etfpush import aggregate, config, history, sources
 
-# 回补与当日推送必须同口径：原版放宽到 900 只就写入，而线上闸门是 1200 只，
-# 于是同一张「近 10 个交易日」表里会掺入只统计了半个市场的行，
-# 「所有ETF」列在拼接处凭空跳变，看起来像行情突变，其实是数据缺失。
-BACKFILL_MIN_ETFS = 1200
+# 回补与当日推送必须同口径：线上闸门已改为动态比例
+# （max(1200, 有效候选×90%)，见 aggregate.sanity_check），
+# 裸 1200 的旧闸门会把当日推送判不合格的残缺行写进历史，
+# 同一张「近 10 个交易日」表在拼接处凭空跳变。
+# 实际闸门统一走 aggregate.sanity_check（见 main）。
 
 
 def _parse_args(argv=None):
@@ -55,6 +56,10 @@ def main(argv=None) -> int:
     dates = sorted(flows)[-args.days:]
 
     hist = history.load()
+    # 与线上当日推送完全同口径的完整性闸门：动态比例总量 + 各宽基 60%。
+    # 裸 1200 的旧闸门比线上松，会写进当日推送判不合格的残缺行。
+    baseline = sources.universe_stats()
+    expected, expected_total = baseline.get("indices"), baseline.get("total")
     written, skipped, incomplete = 0, 0, 0
     for d in dates:
         if d in hist.get("records", {}) and not args.force:
@@ -64,9 +69,11 @@ def main(argv=None) -> int:
         rows = flows[d]
         stats, info = aggregate.aggregate(rows)
         total = info["counts"]["所有ETF"]
-        if total < BACKFILL_MIN_ETFS:
-            print(f"⚠️ {d} 仅 {total} 只 ETF（<{BACKFILL_MIN_ETFS}），与线上口径不一致，"
-                  f"暂不写入；缓存已保留，再次运行本脚本即可从断点续传补齐")
+        try:
+            aggregate.sanity_check(info, expected, expected_total)
+        except RuntimeError as exc:
+            print(f"⚠️ {d} 仅 {total} 只，未过完整性闸门（与当日推送同口径），"
+                  f"暂不写入；缓存已保留，再次运行本脚本即可从断点续传补齐（{exc}）")
             incomplete += 1
             continue
         hist = history.upsert(hist, d, stats)
