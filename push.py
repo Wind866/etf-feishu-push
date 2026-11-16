@@ -91,35 +91,65 @@ def _print_table(hist: dict, trade_date: str, days: int) -> None:
     print()
 
 
+def _backfill_reason(hist: dict, trade_date: str) -> str | None:
+    """需要回补历史时返回原因（写进日志、供测试断言）；历史完整时返回 None。
+
+    原版只看「近 20 天记录数 < DISPLAY_DAYS」，只覆盖新仓库冷启动：
+    中途某天被东财限流漏推时记录数仍是 10，函数直接返回 —— 缺的那一格
+    永远补不上，与文档承诺的「10 日对照表不会永久缺一格」不符。
+
+    这里加一道**精确缺口检测**：用上证指数日 K 当交易日历（每个交易日
+    必有 K 线，周末/节假日天然缺席，见 sources.trade_calendar），找出
+    近 20 个自然日内「真实交易日却没进 history.json」的日子。
+      * 节假日不会误报（不在日历里）；
+      * 真漏推的日子每天重试直到补上，正是期望行为；
+      * 日历探测失败时保守返回 None（回补是锦上添花，不能误触发）。
+    """
+    records = sorted(hist.get("records") or {})
+    try:
+        since = (datetime.strptime(trade_date, "%Y-%m-%d")
+                 - timedelta(days=20)).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+    have = sum(1 for d in records if d >= since)
+    if have < config.DISPLAY_DAYS:
+        return (f"近 20 天只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史"
+                "（冷启动或长期缺数）")
+    missing = [d for d in sources.trade_calendar(lmt=40)
+               if since <= d <= trade_date and d not in set(records)]
+    if missing:
+        return f"近 20 天内有真实交易日缺记录：{missing}"
+    return None
+
+
 def _auto_backfill(hist: dict, trade_date: str) -> None:
     """历史不足或有缺口时，顺手补一轮（**推送成功之后**才调用）。
 
     新仓库上线后 history.json 只有当天一条：10 日对照表要干等两周才长出来；
     中途某天被东财限流漏推，那张表也会永久缺一格。指望人记得去点
-    workflow_dispatch(mode=backfill) 并不现实，所以这里自动补：
+    workflow_dispatch(mode=backfill) 并不现实，所以这里自动补，触发条件
+    （满足其一，见 _backfill_reason）：
 
-      * 触发条件：最近 20 个自然日内的记录数 < DISPLAY_DAYS（刚开始积累、或有缺口）；
-      * 补齐即停：凑够 DISPLAY_DAYS 天后这个函数什么都不做；
-      * 复用 backfill.py 的断点缓存与 1200 只口径闸门，补出来的数与当日推送同口径。
+      * 近 20 个自然日内的记录数 < DISPLAY_DAYS（刚开始积累、长期缺数）；
+      * 日历检测到近 20 天内有真实交易日缺记录（单日漏推的精确修复）。
 
-    必须放在「推送成功、推送状态已写」之后：补历史是锦上添花，不能因为它
-    失败就把当天的推送判成失败 —— 所有异常都在这里吞掉并记录。
+    补齐即停：历史完整时这个函数什么都不做。复用 backfill.py 的断点
+    缓存与完整性闸门，补出来的数与当日推送同口径。必须放在「推送成功、
+    推送状态已写」之后：补历史是锦上添花，不能因为它失败就把当天的
+    推送判成失败 —— 所有异常都在这里吞掉并记录。
     """
     if os.environ.get("AUTO_BACKFILL", "1").strip() == "0":
         print("ℹ️ AUTO_BACKFILL=0，跳过多日历史自动回补")
         return
-    try:
-        since = (datetime.strptime(trade_date, "%Y-%m-%d")
-                 - timedelta(days=20)).strftime("%Y-%m-%d")
-    except ValueError:
+    reason = _backfill_reason(hist, trade_date)
+    if not reason:
         return
-    have = sum(1 for d in (hist.get("records") or {}) if d >= since)
-    if have >= config.DISPLAY_DAYS:
-        return
-    print(f"🧩 近 20 天只有 {have}/{config.DISPLAY_DAYS} 个交易日的历史，自动回补一次…")
+    print(f"🧩 自动回补历史：{reason}")
     try:
         import backfill  # noqa: PLC0415 - 日常推送不需要它，延迟导入
-        backfill.main(["--days", str(config.DISPLAY_DAYS)])
+        # 原来只补最近 10 个交易日：缺口落在第 11~14 个交易日时永远追不上，
+        # 会变成每天空跑。--days 20 覆盖整个 20 个自然日检测窗口。
+        backfill.main(["--days", "20"])
     except SystemExit as exc:
         print(f"⚠️ 自动回补提前结束（exit={exc.code}），历史可能仍不完整")
     except Exception as exc:  # noqa: BLE001 - 绝不能影响已完成的推送

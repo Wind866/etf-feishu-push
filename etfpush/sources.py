@@ -857,6 +857,27 @@ def _plausible_quote_date(d, today: date) -> bool:
     return -1 <= (today - d).days <= config.SESSION_MAX_STALE_DAYS
 
 
+def trade_calendar(lmt: int = 40, secid: str = "1.000001") -> list[str]:
+    """指数日 K → 最近 lmt 个真实交易日（YYYY-MM-DD，升序）；失败返回 []。
+
+    项目不维护节假日表，但「自动回补缺漏」需要知道哪些日子本该有记录。
+    用上证指数日 K 当免费、精确的交易日历：指数每个交易日必有 K 线，
+    周末/节假日天然缺席，不需要任何本地节假日逻辑。调用方在探测失败
+    （返回 []）时应保守跳过，不要误触发回补。
+    """
+    try:
+        text = http_get("https://push2his.eastmoney.com/api/qt/stock/kline/get", params={
+            "secid": secid, "klt": 101, "fqt": 1, "lmt": lmt, "end": "20500101",
+            "fields1": "f1,f2,f3", "fields2": "f51,f53", "ut": EM_UT,
+        }, timeout=15, retries=2, expect_json=True)
+        data = (json.loads(text) or {}).get("data") or {}
+        klines = data.get("klines") or []
+        return sorted(line.split(",")[0] for line in klines if line)
+    except Exception as exc:  # noqa: BLE001 - 探测失败交由调用方保守处理
+        print(f"  ⚠️ 交易日历探测失败（忽略）：{exc}")
+        return []
+
+
 def latest_trade_date(today: date | None = None) -> date | None:
     """返回「最新一个已有行情的交易日」；两个探测源都失败/异常时返回 None。"""
     today = today or datetime.now(config.CN_TZ).date()
