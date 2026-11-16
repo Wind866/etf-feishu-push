@@ -22,10 +22,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
 from datetime import date, datetime
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -36,7 +38,42 @@ from . import config
 #   有些站点的 WAF 按 TLS 指纹拦 Python-requests，curl 却能过；
 #   反过来也有人遇到 curl 被拦。两个都试，覆盖面最大。
 #   加 `-4` 强制 IPv4：runner 解析到异常 IPv6 时连接会被对端重置。
+#
+#   可选转发代理（EM_PROXY_URL）：东财会把 GitHub runner 的数据中心段
+#   整段掐掉（TLS 中途 EOF / 502，本地与 runner 行为差异巨大），这时
+#   把请求交给 Cloudflare Worker 中继（见 worker/em-proxy.js）再转东财。
+#   只对 *.eastmoney.com 生效：腾讯/新浪/天天基金探测仍走直连，不白耗
+#   一趟代理，也不受代理可用性拖累。代理失败自动回退直连，两种通道
+#   都试，代理挂了不影响原有链路。
 # ---------------------------------------------------------------
+
+_EM_HOST_SUFFIX = "eastmoney.com"
+
+
+def _is_em_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == _EM_HOST_SUFFIX or host.endswith("." + _EM_HOST_SUFFIX)
+
+
+def _via_proxy(url: str, params: dict | None, timeout: int) -> str:
+    """经 Cloudflare Worker 中继请求东财（EM_PROXY_URL 未配置时抛错）。"""
+    base = os.environ.get("EM_PROXY_URL", "").strip()
+    if not base:
+        raise RuntimeError("EM_PROXY_URL 未配置")
+    full = requests.Request("GET", url, params=params).prepare().url
+    sep = "&" if "?" in base else "?"
+    proxied = f"{base}{sep}url={quote(full, safe='')}"
+    headers = dict(config.HTTP_HEADERS)
+    token = os.environ.get("EM_PROXY_TOKEN", "").strip()
+    if token:
+        headers["x-proxy-token"] = token
+    resp = requests.get(proxied, headers=headers, timeout=timeout + 5)
+    resp.raise_for_status()
+    if not resp.text.strip():
+        raise RuntimeError("代理返回空响应")
+    return resp.text
+
+
 _CURL_OK: bool | None = None
 
 
@@ -50,6 +87,17 @@ def _has_curl() -> bool:
         except Exception:
             _CURL_OK = False
     return _CURL_OK
+
+
+def _proxy_channels(url: str) -> tuple:
+    """配置了 EM_PROXY_URL 且目标是东财域名时，返回代理通道（否则为空）。
+
+    只对 *.eastmoney.com 走代理：腾讯/新浪/天天基金等探测源直连即可，
+    不白耗一趟中继，也不把它们的可用性绑到代理上。
+    """
+    if not os.environ.get("EM_PROXY_URL", "").strip():
+        return ()
+    return (_via_proxy,) if _is_em_host(url) else ()
 
 
 def _via_requests(url: str, params: dict | None, timeout: int) -> str:
@@ -79,10 +127,15 @@ def _via_curl(url: str, params: dict | None, timeout: int) -> str:
 
 def http_get(url: str, params: dict | None = None, timeout: int = 15,
              retries: int = 2, expect_json: bool = False) -> str:
-    """GET，返回文本；失败自动在 requests / curl 之间轮换并重试。"""
+    """GET，返回文本；失败自动在 代理 / requests / curl 之间轮换并重试。
+
+    配置了 EM_PROXY_URL 且目标是东财域名时，代理作为第一通道；代理失败
+    自动回退直连（requests → curl），代理挂掉不会拖垮原有链路。
+    """
+    channels = _proxy_channels(url) + (_via_requests, _via_curl)
     last_err: Exception | None = None
     for attempt in range(retries):
-        for fn in (_via_requests, _via_curl):
+        for fn in channels:
             try:
                 text = fn(url, params, timeout)
                 if expect_json and text.lstrip()[:1] not in ("{", "["):
@@ -930,6 +983,22 @@ def is_trading_day(today: date) -> tuple[bool, str]:
 def probe() -> list[tuple[str, bool, str]]:
     """返回 [(检查项, 是否可用, 细节)]，供 `python push.py --probe` 打印。"""
     results: list[tuple[str, bool, str]] = []
+
+    proxy_url = os.environ.get("EM_PROXY_URL", "").strip()
+    if proxy_url:
+        proxy_ok = False
+        detail = ""
+        try:
+            text = _via_proxy(f"https://push2.eastmoney.com{EM_ULIST_PATH}",
+                              {"fltt": 2, "secids": "1.510300", "fields": "f14,f62"},
+                              timeout=15)
+            proxy_ok = '"f62"' in text
+            detail = "通道正常" if proxy_ok else "返回无 f62"
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc)[:70]
+        results.append(("转发代理 EM_PROXY_URL", proxy_ok, detail))
+    else:
+        results.append(("转发代理 EM_PROXY_URL", False, "未配置（可选，见 worker/em-proxy.js）"))
 
     lt = latest_trade_date()
     results.append(("交易日探测(腾讯/东财)", lt is not None, str(lt or "两个源都没响应")))
