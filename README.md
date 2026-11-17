@@ -14,7 +14,7 @@
 ## 它做什么
 
 - **全市场 ETF 扫描**：抓当日所有 ETF 的主力净流入/流出，按跟踪指数归并成 7 个宽基维度（沪深300 / 中证1000 / 上证50 / 中证500 / 创业板指 / 科创50 / 中证A500），外加「所有ETF」合计共 8 列。
-- **近 10 日对照**：把当天结果写回 `data/history.json`，图上直接给出近 10 日趋势，单日波动不再误导判断。
+- **近 20 日对照**：把当天结果写回 `data/history.json`，图上直接给出近 20 日趋势，单日波动不再误导判断。
 - **三级降级推送**：优先图片消息（需自建应用），失败降级卡片，再失败降级文本卡片——任何一级都不至于让群里收不到消息。
 - **历史可回补**：`backfill.py` 可按区间补数，断档不用手工拼。
 
@@ -64,7 +64,7 @@ etfpush/
   config.py             环境变量与常量
   sources.py            东财数据源（含代理与重试）
   aggregate.py          按指数归并、口径计算
-  render.py             近 10 日对照图（Pillow）
+  render.py             近 20 日对照图（Pillow）
   feishu.py             签名、上传图片、三级降级推送
   history.py            历史读写与 90 日保留
 data/
@@ -109,7 +109,7 @@ python -m unittest discover -s tests
 | 只收到卡片、没有图片 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 未配，或应用缺 `im:resource` | 补配并授权，否则长期走卡片降级 |
 | 飞书返回 19021 | 加签密钥未配或配错 | 补配 `FEISHU_SECRET` / `ALERT_SECRET` |
 | 接口被限流 | 直连东财触发频控 | 配 `EM_PROXY_URL` / `EM_PROXY_TOKEN` 走代理，失败会自动回退直连 |
-| 图上没有近 10 日对比 | `data/history.json` 未提交或刚重置 | 跑一次 `backfill.py` 补齐 |
+| 图上没有近 20 日对比 | `data/history.json` 未提交或刚重置 | 跑一次 `backfill.py` 补齐 |
 
 ## 相关文档
 
