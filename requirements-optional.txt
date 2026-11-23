@@ -7,4 +7,4 @@
 #
 # BIGApush 已经因为「akshare 改 stock_zh_valuation_baidu 的指标名」把版本
 # 钉成 1.20.42；这里跟随同一版本，避免两个仓库对同一上游行为做不同假设。
-akshare==1.20.42
+akshare==1.20.65
